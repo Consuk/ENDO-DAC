@@ -42,7 +42,7 @@ class MonoDataset(data.Dataset):
                  frame_idxs,
                  num_scales,
                  is_train=False,
-                 img_ext='.png'):
+                 img_ext='.jpg'):
         super(MonoDataset, self).__init__()
 
         self.data_path = data_path
