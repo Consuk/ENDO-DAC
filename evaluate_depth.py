@@ -15,6 +15,7 @@ import scipy.stats as st
 from utils.layers import disp_to_depth
 from utils.utils import readlines, compute_errors
 from options import MonodepthOptions
+from datasets.scared_dataset import SCAREDRAWDataset
 import datasets
 import models.encoders as encoders
 import models.decoders as decoders
@@ -72,15 +73,18 @@ def evaluate(opt):
 
         if opt.eval_split == 'endovis':
             filenames = readlines(os.path.join(splits_dir, opt.eval_split, "test_files.txt"))
-            dataset = datasets.SCAREDRAWDataset(opt.data_path, filenames,
-                                            opt.height, opt.width,
-                                            [0], 4, is_train=False)
+            dataset = SCAREDRAWDataset(
+                opt.data_path, filenames,
+                opt.height, opt.width,
+                [0], 4, is_train=False
+            )
         elif opt.eval_split == 'hamlyn':
-            dataset = datasets.HamlynDataset(opt.data_path, opt.height, opt.width,
-                                                [0], 4, is_train=False)
+            dataset = HamlynDataset(opt.data_path, opt.height, opt.width,
+                                    [0], 4, is_train=False)
         elif opt.eval_split == 'c3vd':
-            dataset = datasets.C3VDDataset(opt.data_path, opt.height, opt.width,
-                                                [0], 4, is_train=False)
+            dataset = C3VDDataset(opt.data_path, opt.height, opt.width,
+                                [0], 4, is_train=False)
+
             MAX_DEPTH = 100
 
         dataloader = DataLoader(dataset, 1, shuffle=False, num_workers=opt.num_workers,
