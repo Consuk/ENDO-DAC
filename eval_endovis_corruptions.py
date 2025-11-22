@@ -60,10 +60,13 @@ def _looks_like_endodac_decoder(sd_keys):
 def load_model(load_weights_folder, num_layers, device):
     """
     Carga pesos para ResNet clásico o Endo-DAC (DepthAnything ViT + depth_model).
-    Mantiene compatibilidad con nombres:
+    Compatibilidad de nombres:
       - Clásico: encoder.pth, depth.pth
       - Endo-DAC: depth_anything_vitb14.pth (encoder), depth_model.pth (decoder)
+    Además: si es ViT, busca clases en `models/` automáticamente (porque networks solo tiene ResnetEncoder).
     """
+    import importlib, pkgutil, inspect
+
     if not os.path.isdir(load_weights_folder):
         raise FileNotFoundError(f"Cannot find weights folder: {load_weights_folder}")
 
@@ -111,95 +114,117 @@ def load_model(load_weights_folder, num_layers, device):
     enc_keys = list(encoder_dict.keys())
     dec_keys = list(depth_dict.keys())
 
+    def _looks_like_vit_state_dict(sd_keys):
+        vit_hints = ("patch_embed", "pos_embed", "blocks.", "transformer", "attn", "mlp", "norm")
+        return any(any(h in k for h in vit_hints) for k in sd_keys)
+
+    def _looks_like_endodac_decoder(sd_keys):
+        dec_hints = ("reassemble", "fusion", "dpt", "head", "upsample", "refine")
+        return any(any(h in k.lower() for h in dec_hints) for k in sd_keys)
+
     is_vit = _looks_like_vit_state_dict(enc_keys) or _looks_like_endodac_decoder(dec_keys)
 
+    # -------- utilidades para auto-descubrir clases en models/networks ----------
+    def iter_candidate_classes(package_names, patterns):
+        """Itera clases que matchean patterns dentro de paquetes y submódulos."""
+        patterns = [p.lower() for p in patterns]
+        for pkg_name in package_names:
+            try:
+                pkg = importlib.import_module(pkg_name)
+            except Exception:
+                continue
+
+            # clases definidas directo en el paquete
+            for cname, cls in inspect.getmembers(pkg, inspect.isclass):
+                if cls.__module__.startswith(pkg_name) and any(p in cname.lower() for p in patterns):
+                    yield cls
+
+            # clases en submódulos
+            if hasattr(pkg, "__path__"):
+                for m in pkgutil.walk_packages(pkg.__path__, pkg.__name__ + "."):
+                    try:
+                        mod = importlib.import_module(m.name)
+                    except Exception:
+                        continue
+                    for cname, cls in inspect.getmembers(mod, inspect.isclass):
+                        if cls.__module__ == mod.__name__ and any(p in cname.lower() for p in patterns):
+                            yield cls
+
+    def try_instantiate(cls, prefer_num_ch_enc=None):
+        """Intenta construir cls con varias firmas comunes."""
+        # 1) sin args
+        try:
+            return cls()
+        except Exception:
+            pass
+
+        # 2) con scales
+        try:
+            return cls(scales=range(4))
+        except Exception:
+            pass
+
+        # 3) con num_ch_enc si aplica (para decoders)
+        if prefer_num_ch_enc is not None:
+            try:
+                return cls(prefer_num_ch_enc, scales=range(4))
+            except Exception:
+                pass
+            try:
+                return cls(prefer_num_ch_enc)
+            except Exception:
+                pass
+
+        return None
+    # ---------------------------------------------------------------------------
+
     if is_vit:
-        # --- EndoDAC / ViT path ---
-        # Ajusta estos nombres SOLO si tu networks usa otro nombre de clase
-        ENCODER_CANDIDATES = [
-            ("DeepNet", {}),               # tu repo
-            ("DepthNet", {}),
-            ("DepthAnythingEncoder", {}),
-            ("DADepthEncoder", {}),
-            ("EndoDACEncoder", {}),
-            ("mpvit_small", {}),           # fallback común
-        ]
+        # ================= Endo-DAC / ViT PATH =================
+        # Buscamos encoder en models primero, luego networks (por si acaso).
+        encoder_patterns = ["depthanything", "vit", "transformer", "endodac", "deepnet", "encoder", "mpvit"]
+        decoder_patterns = ["depthmodel", "dpt", "reassemble", "fusion", "decoder", "depthdecoder", "endodac"]
 
         enc = None
-        for name, kwargs in ENCODER_CANDIDATES:
-            cls = getattr(networks, name, None)
-            if cls is None and name == "mpvit_small":
-                try:
-                    from networks.mpvit import mpvit_small
-                    cls = mpvit_small
-                except Exception:
-                    cls = None
-            if cls is None:
+        for cls in iter_candidate_classes(["models", "networks"], encoder_patterns):
+            # evitamos agarrar ResnetEncoder por accidente
+            if "resnet" in cls.__name__.lower():
                 continue
-            try:
-                enc = cls(**kwargs)
-            except TypeError:
-                try:
-                    enc = cls()
-                except Exception:
-                    enc = None
+            enc = try_instantiate(cls)
             if enc is not None:
                 break
 
         if enc is None:
-            avail = [n for n in dir(networks) if "Encoder" in n or "Net" in n or "vit" in n.lower()]
             raise RuntimeError(
-                "No se pudo construir encoder EndoDAC/ViT. "
-                "Edita ENCODER_CANDIDATES con el nombre real.\n"
-                f"Disponibles en networks: {avail}"
+                "No se pudo construir encoder EndoDAC/ViT desde models/. "
+                "Revisa que el paquete `models` exista y contenga el encoder."
             )
 
-        DECODER_CANDIDATES = [
-            ("DADepthDecoder", {"scales": range(4)}),
-            ("DepthAnythingDecoder", {"scales": range(4)}),
-            ("DPTDecoder", {"scales": range(4)}),
-            ("DepthNetDecoder", {"scales": range(4)}),
-            ("EndoDACDecoder", {"scales": range(4)}),
-            ("DepthDecoder", {"scales": range(4)}),  # fallback si tu DepthDecoder soporta ViT feats
-        ]
+        # Cargamos pesos con strict=False por LoRA / keys extra
+        enc.load_state_dict(encoder_dict, strict=False)
 
+        # Ahora decoder: igual buscamos en models primero
         dec = None
-        for name, kwargs in DECODER_CANDIDATES:
-            cls = getattr(networks, name, None)
-            if cls is None:
+        prefer_num_ch_enc = getattr(enc, "num_ch_enc", None)
+        for cls in iter_candidate_classes(["models", "networks"], decoder_patterns):
+            if "resnet" in cls.__name__.lower():
                 continue
-            try:
-                if "num_ch_enc" in cls.__init__.__code__.co_varnames:
-                    dec = cls(enc.num_ch_enc, **kwargs)
-                else:
-                    dec = cls(**kwargs)
-            except TypeError:
-                try:
-                    dec = cls(enc.num_ch_enc)
-                except Exception:
-                    try:
-                        dec = cls()
-                    except Exception:
-                        dec = None
+            dec = try_instantiate(cls, prefer_num_ch_enc=prefer_num_ch_enc)
             if dec is not None:
                 break
 
         if dec is None:
-            avail = [n for n in dir(networks) if "Decoder" in n or "DPT" in n or "Depth" in n]
             raise RuntimeError(
-                "No se pudo construir decoder EndoDAC. "
-                "Edita DECODER_CANDIDATES con el nombre real.\n"
-                f"Disponibles en networks: {avail}"
+                "No se pudo construir decoder EndoDAC desde models/. "
+                "Revisa que exista un decoder tipo DepthModel/DPT en models."
             )
 
-        enc.load_state_dict(encoder_dict, strict=False)
         dec.load_state_dict(depth_dict, strict=False)
 
         encoder = enc
         depth_decoder = dec
 
     else:
-        # --- ResNet (AF-SfMLearner clásico) ---
+        # ================= ResNet clásico =================
         encoder = networks.ResnetEncoder(num_layers, False)
         depth_decoder = networks.DepthDecoder(encoder.num_ch_enc, scales=range(4))
 
@@ -210,6 +235,7 @@ def load_model(load_weights_folder, num_layers, device):
     encoder.to(device).eval()
     depth_decoder.to(device).eval()
     return encoder, depth_decoder
+
 # ===================== FIN ENDODAC LOADER =====================
 
 
