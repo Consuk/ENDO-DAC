@@ -12,9 +12,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from datasets import SCAREDRAWDataset
-from options import MonodepthOptions  # solo para consistencia de estilos (no usamos aquí)
 from utils import readlines
-import networks
 from layers import disp_to_depth
 
 try:
@@ -351,47 +349,63 @@ def evaluate_one_root(data_path_root,
         if len(buffer_imgs) == 0:
             return
 
+        import inspect as pyinspect
+
         with torch.no_grad():
             batch = torch.stack(buffer_imgs, dim=0).to(device)  # [B,3,H,W]
 
+            # intenta sacar feats si hay encoder (pero EndoDAC puede no necesitarlos)
             feats = None
             if encoder is not None:
-                feats = encoder(batch)
+                try:
+                    feats = encoder(batch)
+                except Exception:
+                    feats = None
 
-            # --- Llamada robusta según firma del decoder ---
+            # firma del forward del depth_decoder
             try:
                 sig = pyinspect.signature(depth_decoder.forward)
                 params = [p.name for p in sig.parameters.values() if p.name != "self"]
             except Exception:
                 params = []
 
-            called = False
-            if feats is None:
+            # ---- CASO EndoDAC típico: forward(pixel_values) ----
+            if len(params) == 1:
                 out = depth_decoder(batch)
-                called = True
+
+            # ---- CASO decoder clásico: forward(feats) o forward(pixel_values, feats) ----
             else:
-                if len(params) >= 2:
-                    p0, p1 = params[0].lower(), params[1].lower()
-                    if ("pixel" in p0) or ("image" in p0) or ("rgb" in p0):
-                        out = depth_decoder(batch, feats)
-                        called = True
-                    elif ("pixel" in p1) or ("image" in p1) or ("rgb" in p1):
-                        out = depth_decoder(feats, batch)
-                        called = True
+                called = False
+                if feats is None:
+                    out = depth_decoder(batch)
+                    called = True
+                else:
+                    # si hay >=2 params, decidir orden por nombre
+                    if len(params) >= 2:
+                        p0, p1 = params[0].lower(), params[1].lower()
+                        if ("pixel" in p0) or ("image" in p0) or ("rgb" in p0):
+                            out = depth_decoder(batch, feats)
+                            called = True
+                        elif ("pixel" in p1) or ("image" in p1) or ("rgb" in p1):
+                            out = depth_decoder(feats, batch)
+                            called = True
 
-                if not called:
-                    try:
-                        out = depth_decoder(feats)
-                        called = True
-                    except Exception:
-                        pass
+                    if not called:
+                        # fallback 1: solo feats
+                        try:
+                            out = depth_decoder(feats)
+                            called = True
+                        except Exception:
+                            pass
 
-                if not called:
-                    try:
-                        out = depth_decoder(batch, feats)
-                    except Exception:
-                        out = depth_decoder(feats, batch)
+                    if not called:
+                        # fallback 2: imagen primero
+                        try:
+                            out = depth_decoder(batch, feats)
+                        except Exception:
+                            out = depth_decoder(feats, batch)
 
+            # extraer disp escala 0
             disp0 = _get_disp0(out)
             pred_disp, _ = disp_to_depth(disp0, MIN_DEPTH, MAX_DEPTH)
 
