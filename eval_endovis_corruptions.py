@@ -1,17 +1,17 @@
 # eval_endovis_corruptions.py
 from __future__ import absolute_import, division, print_function
+
 import os
 import argparse
 import csv
 import numpy as np
 import cv2
 from collections import defaultdict
-from datasets import SCAREDRAWDataset
 
 import torch
 from torch.utils.data import DataLoader
 
-# Reutilizamos utilidades y redes del repo
+from datasets import SCAREDRAWDataset
 from options import MonodepthOptions  # solo para consistencia de estilos (no usamos aquí)
 from utils import readlines
 import networks
@@ -21,6 +21,7 @@ try:
     from PIL import Image as PILImage
 except Exception as e:
     raise ImportError("Pillow es requerido: pip install pillow") from e
+
 
 # ===== Constantes/metas =====
 STEREO_SCALE_FACTOR = 5.4
@@ -47,16 +48,6 @@ def compute_errors(gt, pred):
 
 
 # ===================== ENDODAC LOADER (auto ResNet / ViT + nombres reales) =====================
-def _looks_like_vit_state_dict(sd_keys):
-    """Heurística para detectar ViT/DepthAnything/Transformer por nombres de keys."""
-    vit_hints = ("patch_embed", "pos_embed", "blocks.", "transformer", "attn", "mlp", "norm")
-    return any(any(h in k for h in vit_hints) for k in sd_keys)
-
-def _looks_like_endodac_decoder(sd_keys):
-    """Heurística ligera para decoder tipo DPT/Reassemble-Fusion."""
-    dec_hints = ("reassemble", "fusion", "dpt", "head", "upsample", "refine")
-    return any(any(h in k.lower() for h in dec_hints) for k in sd_keys)
-
 def load_model(load_weights_folder, num_layers, device):
     """
     Carga pesos para ResNet clásico o Endo-DAC (DepthAnything ViT + depth_model).
@@ -180,13 +171,11 @@ def load_model(load_weights_folder, num_layers, device):
 
     if is_vit:
         # ================= Endo-DAC / ViT PATH =================
-        # Buscamos encoder en models primero, luego networks (por si acaso).
         encoder_patterns = ["depthanything", "vit", "transformer", "endodac", "deepnet", "encoder", "mpvit"]
         decoder_patterns = ["depthmodel", "dpt", "reassemble", "fusion", "decoder", "depthdecoder", "endodac"]
 
         enc = None
         for cls in iter_candidate_classes(["models", "networks"], encoder_patterns):
-            # evitamos agarrar ResnetEncoder por accidente
             if "resnet" in cls.__name__.lower():
                 continue
             enc = try_instantiate(cls)
@@ -199,10 +188,8 @@ def load_model(load_weights_folder, num_layers, device):
                 "Revisa que el paquete `models` exista y contenga el encoder."
             )
 
-        # Cargamos pesos con strict=False por LoRA / keys extra
         enc.load_state_dict(encoder_dict, strict=False)
 
-        # Ahora decoder: igual buscamos en models primero
         dec = None
         prefer_num_ch_enc = getattr(enc, "num_ch_enc", None)
         for cls in iter_candidate_classes(["models", "networks"], decoder_patterns):
@@ -235,7 +222,6 @@ def load_model(load_weights_folder, num_layers, device):
     encoder.to(device).eval()
     depth_decoder.to(device).eval()
     return encoder, depth_decoder
-
 # ===================== FIN ENDODAC LOADER =====================
 
 
@@ -327,12 +313,10 @@ def evaluate_one_root(data_path_root,
                       strict=False,
                       device="cuda"):
     """
-    Evalúa una raíz (p.ej., .../brightness/severity_1/endovis_data) usando
-    EXACTAMENTE el parser de rutas de SCAREDRAWDataset. Evita DataLoader
-    para poder saltar muestras que falten o fallen al cargar.
-    - strict=True  -> exige que TODAS las entradas del split carguen; de lo contrario lanza.
-    - strict=False -> procesa sólo las que se puedan cargar (lenient).
+    Evalúa una raíz usando SCAREDRAWDataset y procesa manualmente por batch.
     """
+    import inspect as pyinspect
+
     img_ext = '.png' if png else '.jpg'
     try:
         dataset = SCAREDRAWDataset(
@@ -343,8 +327,8 @@ def evaluate_one_root(data_path_root,
         raise RuntimeError(f"No se pudo inicializar SCAREDRAWDataset en {data_path_root}: {e}")
 
     n = len(filenames)
-    kept_indices = []          # índices (del split) que sí se pudieron cargar
-    preds_list   = []          # predicciones por bloque (se concatenan al final)
+    kept_indices = []
+    preds_list   = []
 
     buffer_imgs = []
     buffer_ids  = []
@@ -363,15 +347,52 @@ def evaluate_one_root(data_path_root,
         return out  # tensor directo
 
     def flush_buffer():
-        """Corre inferencia sobre el buffer actual y guarda las disps."""
+        """Inferencia robusta para EndoDAC o ResNet y guarda disps."""
         if len(buffer_imgs) == 0:
             return
+
         with torch.no_grad():
             batch = torch.stack(buffer_imgs, dim=0).to(device)  # [B,3,H,W]
-            feats = encoder(batch)
-            out   = depth_decoder(feats)
-            disp0 = _get_disp0(out)
 
+            feats = None
+            if encoder is not None:
+                feats = encoder(batch)
+
+            # --- Llamada robusta según firma del decoder ---
+            try:
+                sig = pyinspect.signature(depth_decoder.forward)
+                params = [p.name for p in sig.parameters.values() if p.name != "self"]
+            except Exception:
+                params = []
+
+            called = False
+            if feats is None:
+                out = depth_decoder(batch)
+                called = True
+            else:
+                if len(params) >= 2:
+                    p0, p1 = params[0].lower(), params[1].lower()
+                    if ("pixel" in p0) or ("image" in p0) or ("rgb" in p0):
+                        out = depth_decoder(batch, feats)
+                        called = True
+                    elif ("pixel" in p1) or ("image" in p1) or ("rgb" in p1):
+                        out = depth_decoder(feats, batch)
+                        called = True
+
+                if not called:
+                    try:
+                        out = depth_decoder(feats)
+                        called = True
+                    except Exception:
+                        pass
+
+                if not called:
+                    try:
+                        out = depth_decoder(batch, feats)
+                    except Exception:
+                        out = depth_decoder(feats, batch)
+
+            disp0 = _get_disp0(out)
             pred_disp, _ = disp_to_depth(disp0, MIN_DEPTH, MAX_DEPTH)
 
             if pred_disp.ndim == 4:
@@ -414,7 +435,7 @@ def evaluate_one_root(data_path_root,
     if len(kept_indices) == 0:
         mode = "STRICT" if strict else "LENIENT"
         raise FileNotFoundError(
-            f"[{mode}] Ninguna imagen utilizable en {data_path_root} con el parser del dataset "
+            f"[{mode}] Ninguna imagen utilizable en {data_path_root} "
             f"(faltantes/errores: {missing}/{n})."
         )
 
@@ -422,7 +443,7 @@ def evaluate_one_root(data_path_root,
         print(f"   [INFO] {data_path_root}: usando {len(kept_indices)}/{n} frames del split "
               f"(faltaron {missing}).")
 
-    pred_disps = np.concatenate(preds_list, axis=0)  # [M,H',W']
+    pred_disps = np.concatenate(preds_list, axis=0)
     sel_gt     = gt_depths[kept_indices]
 
     errors, ratios = [], []
@@ -476,7 +497,7 @@ def list_corruption_dirs(root):
 
 
 def main():
-    parser = argparse.ArgumentParser("Evaluate EndoVIS corruptions (16x5) with AF-SfMLearner weights")
+    parser = argparse.ArgumentParser("Evaluate EndoVIS corruptions (16x5) with EndoDAC weights")
     parser.add_argument("--corruptions_root", type=str, required=True,
                         help="Raíz de las corrupciones (o una sola corrupción). Ej: /workspace/endovis_corruptions_test")
     parser.add_argument("--load_weights_folder", type=str, required=True,
@@ -498,7 +519,6 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     cv2.setNumThreads(0)
 
-    # Cargar split y GTs
     test_files_path = os.path.join(args.splits_dir, args.split, "test_files.txt")
     if not os.path.isfile(test_files_path):
         raise FileNotFoundError(f"No se encontró test_files.txt en {test_files_path}")
@@ -511,18 +531,14 @@ def main():
 
     if len(test_files) != gt_depths.shape[0]:
         print("[WARN] test_files.txt y gt_depths.npz difieren en longitud. "
-              "Esto es típico cuando hay líneas de split inválidas o extra. "
               "El script filtrará por líneas parseables y existentes por severidad.")
 
-    # Configuración mono/estéreo
     disable_median_scaling = args.eval_stereo
     pred_depth_scale_factor = STEREO_SCALE_FACTOR if args.eval_stereo else 1.0
 
-    # Cargar modelo (una sola vez)
     print("-> Cargando pesos:", args.load_weights_folder)
     encoder, depth_decoder = load_model(args.load_weights_folder, args.num_layers, device)
 
-    # Detectar corrupciones a evaluar
     corr_dirs = list_corruption_dirs(args.corruptions_root)
     if len(corr_dirs) == 0:
         raise FileNotFoundError(f"No se encontraron carpetas de corrupción en {args.corruptions_root}")
@@ -569,7 +585,6 @@ def main():
             except FileNotFoundError as e:
                 print(f"   [SKIP] {e}")
 
-    # Guardar CSV y pretty print
     if rows:
         header = ["corruption", "severity", "abs_rel", "sq_rel", "rmse", "rmse_log", "a1", "a2", "a3"]
         with open(args.output_csv, "w", newline="") as f:
