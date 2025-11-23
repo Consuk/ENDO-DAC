@@ -9,11 +9,21 @@ import cv2
 from collections import defaultdict
 
 import torch
-from torch.utils.data import DataLoader
 
 from datasets import SCAREDRAWDataset
-from utils import readlines
-from layers import disp_to_depth
+
+# ---------- imports alineados a tu estructura utils/ ----------
+# readlines + compute_errors están en utils/utils.py (según tu archivo)
+try:
+    from utils.utils import readlines, compute_errors
+except ImportError:
+    from utils import readlines, compute_errors
+
+# disp_to_depth está en utils/layers.py (según tu archivo)
+try:
+    from utils.layers import disp_to_depth
+except ImportError:
+    from utils import disp_to_depth
 
 try:
     from PIL import Image as PILImage
@@ -27,39 +37,22 @@ MIN_DEPTH = 1e-3
 MAX_DEPTH = 150.0
 
 
-def compute_errors(gt, pred):
-    """Métricas estándar de Monodepth/EndoDepth."""
-    thresh = np.maximum((gt / pred), (pred / gt))
-    a1 = (thresh < 1.25     ).mean()
-    a2 = (thresh < 1.25 ** 2).mean()
-    a3 = (thresh < 1.25 ** 3).mean()
-
-    rmse = (gt - pred) ** 2
-    rmse = np.sqrt(rmse.mean())
-
-    rmse_log = (np.log(gt) - np.log(pred)) ** 2
-    rmse_log = np.sqrt(rmse_log.mean())
-
-    abs_rel = np.mean(np.abs(gt - pred) / gt)
-    sq_rel  = np.mean(((gt - pred) ** 2) / gt)
-    return abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3
-
-
-# ===================== ENDODAC LOADER (auto ResNet / ViT + nombres reales) =====================
+# ===================== ENDODAC LOADER (solo models/, nombres reales) =====================
 def load_model(load_weights_folder, num_layers, device):
     """
-    Carga pesos para ResNet clásico o Endo-DAC (DepthAnything ViT + depth_model).
-    Compatibilidad de nombres:
-      - Clásico: encoder.pth, depth.pth
-      - Endo-DAC: depth_anything_vitb14.pth (encoder), depth_model.pth (decoder)
-    Además: si es ViT, busca clases en `models/` automáticamente (porque networks solo tiene ResnetEncoder).
+    Carga pesos Endo-DAC (DepthAnything ViT + depth_model).
+    Nombres soportados:
+      - encoder.pth / depth.pth (si existieran)
+      - depth_anything*.pth (encoder)
+      - depth_model.pth (depth head EndoDAC)
+    No depende de networks/ porque en tu estructura no existe.
     """
     import importlib, pkgutil, inspect
 
     if not os.path.isdir(load_weights_folder):
         raise FileNotFoundError(f"Cannot find weights folder: {load_weights_folder}")
 
-    # ---- resolver nombres de archivo (fallback Endo-DAC) ----
+    # ---- resolver nombres de archivo ----
     encoder_candidates = [
         "encoder.pth",
         "depth_anything_vitb14.pth",
@@ -90,7 +83,7 @@ def load_model(load_weights_folder, num_layers, device):
 
     if encoder_path is None or decoder_path is None:
         raise FileNotFoundError(
-            "Missing encoder/depth weights. Busqué encoder en: "
+            "Missing EndoDAC weights. Busqué encoder en: "
             f"{encoder_candidates} y decoder en: {decoder_candidates} dentro de {load_weights_folder}"
         )
 
@@ -108,52 +101,38 @@ def load_model(load_weights_folder, num_layers, device):
         return any(any(h in k for h in vit_hints) for k in sd_keys)
 
     def _looks_like_endodac_decoder(sd_keys):
-        dec_hints = ("reassemble", "fusion", "dpt", "head", "upsample", "refine")
+        dec_hints = ("endodac", "reassemble", "fusion", "dpt", "head", "upsample", "refine")
         return any(any(h in k.lower() for h in dec_hints) for k in sd_keys)
 
     is_vit = _looks_like_vit_state_dict(enc_keys) or _looks_like_endodac_decoder(dec_keys)
 
-    # -------- utilidades para auto-descubrir clases en models/networks ----------
-    def iter_candidate_classes(package_names, patterns):
-        """Itera clases que matchean patterns dentro de paquetes y submódulos."""
+    # -------- auto-descubrir clases en models/ ----------
+    def iter_candidate_classes(patterns):
         patterns = [p.lower() for p in patterns]
-        for pkg_name in package_names:
-            try:
-                pkg = importlib.import_module(pkg_name)
-            except Exception:
-                continue
+        try:
+            pkg = importlib.import_module("models")
+        except Exception:
+            return
 
-            # clases definidas directo en el paquete
-            for cname, cls in inspect.getmembers(pkg, inspect.isclass):
-                if cls.__module__.startswith(pkg_name) and any(p in cname.lower() for p in patterns):
-                    yield cls
-
-            # clases en submódulos
-            if hasattr(pkg, "__path__"):
-                for m in pkgutil.walk_packages(pkg.__path__, pkg.__name__ + "."):
-                    try:
-                        mod = importlib.import_module(m.name)
-                    except Exception:
-                        continue
-                    for cname, cls in inspect.getmembers(mod, inspect.isclass):
-                        if cls.__module__ == mod.__name__ and any(p in cname.lower() for p in patterns):
-                            yield cls
+        if hasattr(pkg, "__path__"):
+            for m in pkgutil.walk_packages(pkg.__path__, pkg.__name__ + "."):
+                try:
+                    mod = importlib.import_module(m.name)
+                except Exception:
+                    continue
+                for cname, cls in inspect.getmembers(mod, inspect.isclass):
+                    if cls.__module__ == mod.__name__ and any(p in cname.lower() for p in patterns):
+                        yield cls
 
     def try_instantiate(cls, prefer_num_ch_enc=None):
-        """Intenta construir cls con varias firmas comunes."""
-        # 1) sin args
         try:
             return cls()
         except Exception:
             pass
-
-        # 2) con scales
         try:
             return cls(scales=range(4))
         except Exception:
             pass
-
-        # 3) con num_ch_enc si aplica (para decoders)
         if prefer_num_ch_enc is not None:
             try:
                 return cls(prefer_num_ch_enc, scales=range(4))
@@ -163,45 +142,36 @@ def load_model(load_weights_folder, num_layers, device):
                 return cls(prefer_num_ch_enc)
             except Exception:
                 pass
-
         return None
-    # ---------------------------------------------------------------------------
+    # ----------------------------------------------------
 
     if is_vit:
-        # ================= Endo-DAC / ViT PATH =================
-        encoder_patterns = ["depthanything", "vit", "transformer", "endodac", "deepnet", "encoder", "mpvit"]
-        decoder_patterns = ["depthmodel", "dpt", "reassemble", "fusion", "decoder", "depthdecoder", "endodac"]
+        # ======= EndoDAC/ViT encoder + modelo depth =======
+        encoder_patterns = ["depthanything", "vit", "transformer", "encoder", "backbone"]
+        decoder_patterns = ["endodac", "depthmodel", "dpt", "decoder", "depth"]
 
         enc = None
-        for cls in iter_candidate_classes(["models", "networks"], encoder_patterns):
+        for cls in iter_candidate_classes(encoder_patterns):
             if "resnet" in cls.__name__.lower():
                 continue
             enc = try_instantiate(cls)
             if enc is not None:
                 break
-
         if enc is None:
-            raise RuntimeError(
-                "No se pudo construir encoder EndoDAC/ViT desde models/. "
-                "Revisa que el paquete `models` exista y contenga el encoder."
-            )
+            raise RuntimeError("No se pudo construir encoder ViT desde models/.")
 
         enc.load_state_dict(encoder_dict, strict=False)
 
         dec = None
         prefer_num_ch_enc = getattr(enc, "num_ch_enc", None)
-        for cls in iter_candidate_classes(["models", "networks"], decoder_patterns):
+        for cls in iter_candidate_classes(decoder_patterns):
             if "resnet" in cls.__name__.lower():
                 continue
             dec = try_instantiate(cls, prefer_num_ch_enc=prefer_num_ch_enc)
             if dec is not None:
                 break
-
         if dec is None:
-            raise RuntimeError(
-                "No se pudo construir decoder EndoDAC desde models/. "
-                "Revisa que exista un decoder tipo DepthModel/DPT en models."
-            )
+            raise RuntimeError("No se pudo construir modelo/depth head EndoDAC desde models/.")
 
         dec.load_state_dict(depth_dict, strict=False)
 
@@ -209,91 +179,15 @@ def load_model(load_weights_folder, num_layers, device):
         depth_decoder = dec
 
     else:
-        # ================= ResNet clásico =================
-        encoder = networks.ResnetEncoder(num_layers, False)
-        depth_decoder = networks.DepthDecoder(encoder.num_ch_enc, scales=range(4))
-
-        model_dict = encoder.state_dict()
-        encoder.load_state_dict({k: v for k, v in encoder_dict.items() if k in model_dict}, strict=False)
-        depth_decoder.load_state_dict(depth_dict, strict=False)
+        raise RuntimeError(
+            "Los pesos no parecen ViT/EndoDAC y no hay networks/. "
+            "Este script está pensado para Endo-DAC."
+        )
 
     encoder.to(device).eval()
     depth_decoder.to(device).eval()
     return encoder, depth_decoder
 # ===================== FIN ENDODAC LOADER =====================
-
-
-def _parse_split_line(line: str):
-    """
-    Soporta formato tokenizado tipo:
-        dataset3 keyframe4 390 l
-    Devuelve: ds, keyf, frame_idx:int, side:str
-    """
-    parts = line.strip().split()
-    if len(parts) < 4:
-        raise ValueError(f"Línea de split inválida: {line!r}")
-    ds, keyf, frame_str, side = parts[0], parts[1], parts[2], parts[3]
-    return ds, keyf, int(frame_str), side
-
-
-def _build_img_path(root, ds, keyf, frame_idx, png=False):
-    """
-    Construye la ruta real:
-      <root>/<dataset>/<keyframe>/data/<frame>.<ext>
-    """
-    ext = ".png" if png else ".jpg"
-    return os.path.join(root, ds, keyf, "data", f"{frame_idx}{ext}")
-
-
-class SimpleImageDataset(torch.utils.data.Dataset):
-    """Dataset mínimo que toma rutas absolutas ya resueltas."""
-    def __init__(self, paths, height, width):
-        self.paths = paths
-        self.h = height
-        self.w = width
-
-    def __len__(self):
-        return len(self.paths)
-
-    def __getitem__(self, idx):
-        img = PILImage.open(self.paths[idx]).convert('RGB')
-        img = img.resize((self.w, self.h), PILImage.LANCZOS)
-        img = np.asarray(img).astype(np.float32) / 255.0
-        img = torch.from_numpy(img).permute(2, 0, 1)  # C,H,W
-        return {("color", 0, 0): img}
-
-
-def map_split_to_existing_paths(data_path_root, filenames, png=False, strict=False):
-    """
-    Traduce cada línea tokenizada del split a una ruta real y
-    - strict=False: devuelve SOLO las que existan (lenient).
-    - strict=True : exige que existan TODAS; si falta alguna, lanza FileNotFoundError.
-
-    Returns:
-      idx_keep: indices del split que sí existen
-      real_paths: rutas absolutas correspondientes
-    """
-    idx_keep, real_paths, missing = [], [], []
-    for i, line in enumerate(filenames):
-        try:
-            ds, keyf, frame_idx, side = _parse_split_line(line)
-            p = _build_img_path(data_path_root, ds, keyf, frame_idx, png=png)
-            if os.path.isfile(p):
-                idx_keep.append(i)
-                real_paths.append(p)
-            else:
-                missing.append(line.strip())
-        except Exception:
-            missing.append(line.strip())
-
-    if strict and len(missing) > 0:
-        first = missing[0] if len(missing) else "N/A"
-        raise FileNotFoundError(
-            f"[STRICT] En {data_path_root} faltan {len(missing)} entradas del split. "
-            f"Primera ausente: {first}"
-        )
-
-    return idx_keep, real_paths, missing
 
 
 def evaluate_one_root(data_path_root,
@@ -304,25 +198,22 @@ def evaluate_one_root(data_path_root,
                       height=256,
                       width=320,
                       batch_size=16,
-                      num_workers=4,       # se ignora en este flujo manual
+                      num_workers=4,
                       png=False,
                       disable_median_scaling=False,
                       pred_depth_scale_factor=1.0,
                       strict=False,
                       device="cuda"):
     """
-    Evalúa una raíz usando SCAREDRAWDataset y procesa manualmente por batch.
+    Evalúa una raíz (corrupción/severidad) con EndoDAC.
     """
     import inspect as pyinspect
 
     img_ext = '.png' if png else '.jpg'
-    try:
-        dataset = SCAREDRAWDataset(
-            data_path_root, filenames, height, width,
-            [0], 4, is_train=False, img_ext=img_ext
-        )
-    except Exception as e:
-        raise RuntimeError(f"No se pudo inicializar SCAREDRAWDataset en {data_path_root}: {e}")
+    dataset = SCAREDRAWDataset(
+        data_path_root, filenames, height, width,
+        [0], 4, is_train=False, img_ext=img_ext
+    )
 
     n = len(filenames)
     kept_indices = []
@@ -332,7 +223,7 @@ def evaluate_one_root(data_path_root,
     buffer_ids  = []
 
     def _get_disp0(out):
-        """Extrae disp a resolución 0 desde dict/list/tensor."""
+        """Extrae disp escala 0 desde dict/list/tensor."""
         if isinstance(out, dict):
             if ("disp", 0) in out:
                 return out[("disp", 0)]
@@ -342,19 +233,16 @@ def evaluate_one_root(data_path_root,
                 return out[("pred_disp", 0)]
         if isinstance(out, (list, tuple)):
             return out[0]
-        return out  # tensor directo
+        return out
 
     def flush_buffer():
-        """Inferencia robusta para EndoDAC o ResNet y guarda disps."""
         if len(buffer_imgs) == 0:
             return
-
-        import inspect as pyinspect
 
         with torch.no_grad():
             batch = torch.stack(buffer_imgs, dim=0).to(device)  # [B,3,H,W]
 
-            # intenta sacar feats si hay encoder (pero EndoDAC puede no necesitarlos)
+            # feats opcionales (pero EndoDAC winner suele NO usarlos en forward)
             feats = None
             if encoder is not None:
                 try:
@@ -362,50 +250,40 @@ def evaluate_one_root(data_path_root,
                 except Exception:
                     feats = None
 
-            # firma del forward del depth_decoder
+            # firma del forward del modelo EndoDAC
             try:
                 sig = pyinspect.signature(depth_decoder.forward)
                 params = [p.name for p in sig.parameters.values() if p.name != "self"]
             except Exception:
                 params = []
 
-            # ---- CASO EndoDAC típico: forward(pixel_values) ----
+            # --- Caso EndoDAC típico: forward(pixel_values) ---
             if len(params) == 1:
                 out = depth_decoder(batch)
-
-            # ---- CASO decoder clásico: forward(feats) o forward(pixel_values, feats) ----
             else:
+                # si el modelo acepta más args, intentamos pasar imagen+feats
                 called = False
                 if feats is None:
-                    out = depth_decoder(batch)
-                    called = True
+                    out = depth_decoder(batch); called = True
                 else:
-                    # si hay >=2 params, decidir orden por nombre
                     if len(params) >= 2:
                         p0, p1 = params[0].lower(), params[1].lower()
                         if ("pixel" in p0) or ("image" in p0) or ("rgb" in p0):
-                            out = depth_decoder(batch, feats)
-                            called = True
+                            out = depth_decoder(batch, feats); called = True
                         elif ("pixel" in p1) or ("image" in p1) or ("rgb" in p1):
-                            out = depth_decoder(feats, batch)
-                            called = True
+                            out = depth_decoder(feats, batch); called = True
 
                     if not called:
-                        # fallback 1: solo feats
                         try:
-                            out = depth_decoder(feats)
-                            called = True
+                            out = depth_decoder(feats); called = True
                         except Exception:
                             pass
-
                     if not called:
-                        # fallback 2: imagen primero
                         try:
                             out = depth_decoder(batch, feats)
                         except Exception:
                             out = depth_decoder(feats, batch)
 
-            # extraer disp escala 0
             disp0 = _get_disp0(out)
             pred_disp, _ = disp_to_depth(disp0, MIN_DEPTH, MAX_DEPTH)
 
@@ -421,6 +299,7 @@ def evaluate_one_root(data_path_root,
             img_t  = sample[("color", 0, 0)]
             if not isinstance(img_t, torch.Tensor):
                 img_t = torch.as_tensor(img_t)
+
             buffer_imgs.append(img_t)
             buffer_ids.append(i)
 
@@ -430,18 +309,10 @@ def evaluate_one_root(data_path_root,
                 buffer_imgs.clear()
                 buffer_ids.clear()
 
-        except FileNotFoundError:
+        except Exception:
             missing += 1
             if strict:
-                raise FileNotFoundError(
-                    f"[STRICT] Falta la muestra del split idx={i} en {data_path_root}"
-                )
-        except Exception as e:
-            missing += 1
-            if strict:
-                raise RuntimeError(
-                    f"[STRICT] Error cargando idx={i} en {data_path_root}: {e}"
-                )
+                raise
 
     flush_buffer()
     kept_indices.extend(buffer_ids)
@@ -452,10 +323,6 @@ def evaluate_one_root(data_path_root,
             f"[{mode}] Ninguna imagen utilizable en {data_path_root} "
             f"(faltantes/errores: {missing}/{n})."
         )
-
-    if (not strict) and missing > 0:
-        print(f"   [INFO] {data_path_root}: usando {len(kept_indices)}/{n} frames del split "
-              f"(faltaron {missing}).")
 
     pred_disps = np.concatenate(preds_list, axis=0)
     sel_gt     = gt_depths[kept_indices]
@@ -481,8 +348,7 @@ def evaluate_one_root(data_path_root,
             ratios.append(ratio)
             pd *= ratio
 
-        pd[pd < MIN_DEPTH] = MIN_DEPTH
-        pd[pd > MAX_DEPTH] = MAX_DEPTH
+        pd = np.clip(pd, MIN_DEPTH, MAX_DEPTH)
 
         errors.append(compute_errors(gd, pd))
 
@@ -491,15 +357,10 @@ def evaluate_one_root(data_path_root,
         med = np.median(ratios)
         print(f"    Scaling ratios | med: {med:0.3f} | std: {np.std(ratios / med):0.3f}")
 
-    mean_errors = np.array(errors).mean(0)
-    return mean_errors
+    return np.array(errors).mean(0)
 
 
 def list_corruption_dirs(root):
-    """
-    Devuelve los directorios de primer nivel que representan corrupciones.
-    Si 'root' ya es una carpeta de una corrupción (que contiene severity_*), la devuelve tal cual.
-    """
     if not os.path.isdir(root):
         return []
     severities = [d for d in os.listdir(root)
@@ -512,22 +373,19 @@ def list_corruption_dirs(root):
 
 def main():
     parser = argparse.ArgumentParser("Evaluate EndoVIS corruptions (16x5) with EndoDAC weights")
-    parser.add_argument("--corruptions_root", type=str, required=True,
-                        help="Raíz de las corrupciones (o una sola corrupción). Ej: /workspace/endovis_corruptions_test")
-    parser.add_argument("--load_weights_folder", type=str, required=True,
-                        help="Carpeta con pesos (EndoDAC o ResNet).")
+    parser.add_argument("--corruptions_root", type=str, required=True)
+    parser.add_argument("--load_weights_folder", type=str, required=True)
     parser.add_argument("--splits_dir", type=str, default=os.path.join(os.path.dirname(__file__), "splits"))
-    parser.add_argument("--split", type=str, default="endovis", help="Nombre del split (carpeta dentro de splits/)")
+    parser.add_argument("--split", type=str, default="endovis")
     parser.add_argument("--num_layers", type=int, default=18)
     parser.add_argument("--height", type=int, default=256)
     parser.add_argument("--width", type=int, default=320)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--png", action="store_true", help="Usa .png en lugar de .jpg")
-    parser.add_argument("--eval_stereo", action="store_true", help="Forzar estéreo (desactiva median scaling y usa x5.4)")
+    parser.add_argument("--png", action="store_true")
+    parser.add_argument("--eval_stereo", action="store_true")
     parser.add_argument("--output_csv", type=str, default="corruptions_summary.csv")
-    parser.add_argument("--strict", action="store_true",
-                        help="Modo estricto: exige que todas las entradas del split existan en cada severidad.")
+    parser.add_argument("--strict", action="store_true")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -536,16 +394,12 @@ def main():
     test_files_path = os.path.join(args.splits_dir, args.split, "test_files.txt")
     if not os.path.isfile(test_files_path):
         raise FileNotFoundError(f"No se encontró test_files.txt en {test_files_path}")
-
     test_files = readlines(test_files_path)
+
     gt_path = os.path.join(args.splits_dir, args.split, "gt_depths.npz")
     if not os.path.isfile(gt_path):
         raise FileNotFoundError(f"No se encontró gt_depths.npz en {gt_path}")
     gt_depths = np.load(gt_path, fix_imports=True, encoding='latin1')["data"]
-
-    if len(test_files) != gt_depths.shape[0]:
-        print("[WARN] test_files.txt y gt_depths.npz difieren en longitud. "
-              "El script filtrará por líneas parseables y existentes por severidad.")
 
     disable_median_scaling = args.eval_stereo
     pred_depth_scale_factor = STEREO_SCALE_FACTOR if args.eval_stereo else 1.0
@@ -572,40 +426,36 @@ def main():
                 print(f"   [WARN] No existe {data_root}, se omite.")
                 continue
 
-            try:
-                mean_errors = evaluate_one_root(
-                    data_path_root=data_root,
-                    filenames=test_files,
-                    gt_depths=gt_depths,
-                    encoder=encoder,
-                    depth_decoder=depth_decoder,
-                    height=args.height,
-                    width=args.width,
-                    batch_size=args.batch_size,
-                    num_workers=args.num_workers,
-                    png=args.png,
-                    disable_median_scaling=disable_median_scaling,
-                    pred_depth_scale_factor=pred_depth_scale_factor,
-                    strict=args.strict,
-                    device=device
-                )
-                abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3 = mean_errors.tolist()
-                rows.append([corr_name, sev, abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3])
+            mean_errors = evaluate_one_root(
+                data_path_root=data_root,
+                filenames=test_files,
+                gt_depths=gt_depths,
+                encoder=encoder,
+                depth_decoder=depth_decoder,
+                height=args.height,
+                width=args.width,
+                batch_size=args.batch_size,
+                num_workers=args.num_workers,
+                png=args.png,
+                disable_median_scaling=disable_median_scaling,
+                pred_depth_scale_factor=pred_depth_scale_factor,
+                strict=args.strict,
+                device=device
+            )
 
-                print("   Métricas (promedio): "
-                      f"abs_rel={abs_rel:.3f} | sq_rel={sq_rel:.3f} | rmse={rmse:.3f} | "
-                      f"rmse_log={rmse_log:.3f} | a1={a1:.3f} | a2={a2:.3f} | a3={a3:.3f}")
+            abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3 = mean_errors.tolist()
+            rows.append([corr_name, sev, abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3])
 
-            except FileNotFoundError as e:
-                print(f"   [SKIP] {e}")
+            print("   Métricas (promedio): "
+                  f"abs_rel={abs_rel:.3f} | sq_rel={sq_rel:.3f} | rmse={rmse:.3f} | "
+                  f"rmse_log={rmse_log:.3f} | a1={a1:.3f} | a2={a2:.3f} | a3={a3:.3f}")
 
     if rows:
         header = ["corruption", "severity", "abs_rel", "sq_rel", "rmse", "rmse_log", "a1", "a2", "a3"]
         with open(args.output_csv, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(header)
-            for r in rows:
-                w.writerow(r)
+            w.writerows(rows)
 
         print(f"\n-> Resumen guardado en: {args.output_csv}")
 
@@ -623,7 +473,7 @@ def main():
                 print(f"{sev:>9} | {abs_rel:7.3f} | {sq_rel:7.3f} | {rmse:7.3f} |  {rmse_log:7.3f} | "
                       f"{a1:6.3f} | {a2:6.3f} | {a3:6.3f}")
     else:
-        print("\n-> No se generaron filas. Revisa rutas/archivos faltantes o estructura de corrupciones.")
+        print("\n-> No se generaron filas. Revisa estructura de corrupciones.")
 
 
 if __name__ == "__main__":
