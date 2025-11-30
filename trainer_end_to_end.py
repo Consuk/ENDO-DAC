@@ -1,5 +1,8 @@
 from __future__ import absolute_import, division, print_function
 
+import wandb
+
+
 import time
 import json
 import datasets
@@ -163,6 +166,16 @@ class Trainer:
         self.writers = {}
         for mode in ["train", "val"]:
             self.writers[mode] = SummaryWriter(os.path.join(self.log_path, mode))
+         # ---------------- W&B init ----------------
+        self.use_wandb = getattr(self.opt, "use_wandb", False)
+        if self.use_wandb:
+            run_name = getattr(self.opt, "wandb_run_name", None) or self.opt.model_name
+            wandb.init(
+                project=getattr(self.opt, "wandb_project", "endodac"),
+                name=run_name,
+                config=self.opt.__dict__,
+            )
+        # ------------------------------------------
 
         if not self.opt.no_ssim:
             self.ssim = SSIM()
@@ -803,6 +816,13 @@ class Trainer:
         writer = self.writers[mode]
         for l, v in losses.items():
             writer.add_scalar("{}".format(l), v, self.step)
+        
+        # ---- W&B scalar logging ----
+        if getattr(self, "use_wandb", False):
+            wandb_log_dict = {f"{mode}/{l}": float(v) for l, v in losses.items()}
+            wandb_log_dict["step"] = self.step
+            wandb.log(wandb_log_dict, step=self.step)
+        # ----------------------------
 
         for j in range(min(4, self.opt.batch_size)):  # write a maxmimum of four images
             for s in self.opt.scales:
@@ -825,6 +845,48 @@ class Trainer:
                 writer.add_image(
                     "disp_{}/{}".format(s, j),
                     normalize_image(outputs[("disp", s)][j]), self.step)
+                # Existing TensorBoard image logging remains above...
+        # ---- W&B image logging (one sample) ----
+        if getattr(self, "use_wandb", False):
+            try:
+                # take the first sample in batch
+                j = 0
+
+                # 1) Input RGB (color, frame 0, scale 0)
+                if ("color", 0, 0) in inputs:
+                    color = inputs[("color", 0, 0)][j].detach().cpu()  # CxHxW
+                    color_np = (color.permute(1, 2, 0).numpy() * 255.0).clip(0, 255).astype(np.uint8)
+                else:
+                    color_np = None
+
+                # 2) Predicted depth at scale 0
+                # `generate_images_pred` already stored it as outputs[("depth", 0, 0)]
+                if ("depth", 0, 0) in outputs:
+                    depth = outputs[("depth", 0, 0)][j, 0].detach().cpu().numpy()  # HxW
+
+                    d_min = depth.min()
+                    d_max = depth.max()
+                    depth_norm = (depth - d_min) / (d_max - d_min + 1e-7)  # 0-1
+
+                else:
+                    depth_norm = None
+
+                wandb_images = {}
+
+                if color_np is not None:
+                    wandb_images[f"{mode}/rgb"] = wandb.Image(color_np, caption=f"{mode} RGB step {self.step}")
+
+                if depth_norm is not None:
+                    wandb_images[f"{mode}/depth"] = wandb.Image(depth_norm, caption=f"{mode} depth step {self.step}")
+
+                if len(wandb_images) > 0:
+                    wandb.log(wandb_images, step=self.step)
+
+            except Exception as e:
+                # Don't crash training if logging fails
+                print(f"[W&B] Failed to log images at step {self.step}: {e}")
+        # ----------------------------------------
+
 
     def save_opts(self):
         """Save options to disk so we know what we ran this experiment with

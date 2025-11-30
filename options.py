@@ -256,6 +256,24 @@ class MonodepthOptions:
                                  help="if set will perform the flipping post processing "
                                       "from the original monodepth paper",
                                  action="store_true")
+        self.parser.add_argument(
+                              "--use_wandb",
+                              action="store_true",
+                              help="Log metrics and images to Weights & Biases"
+                              )
+        self.parser.add_argument(
+                              "--wandb_project",
+                              type=str,
+                              default="endodac",
+                              help="W&B project name"
+                              )
+        self.parser.add_argument(
+                              "--wandb_run_name",
+                              type=str,
+                              default=None,
+                              help="Optional W&B run name (defaults to model_name)"
+                              )
+
 
         # EVALUATION options
         self.parser.add_argument("--save_recon",
