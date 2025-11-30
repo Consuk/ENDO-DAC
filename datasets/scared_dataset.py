@@ -87,17 +87,40 @@ class SCAREDDataset(MonoDataset):
             side = None
 
         return folder, frame_index, side
-
+    
     def get_image_path(self, folder, frame_index, side):
-        #SCATER
-        f_str = "{}{}".format(frame_index, self.img_ext)
-        image_path = os.path.join(self.data_path, folder, "data", f_str)
-        #COLON10k
+        """
+        Build full image path for both:
+        - SCARED / EndoVis (datasetX/keyframeY/data/XXX.png)
+        - Hamlyn rectified images (rectifiedXX/rectifiedXX/image01/XXXXXXXXXX.png)
+        """
 
-        #f_str=str(frame_index) + self.img_ext
-        #image_path = os.path.join(self.data_path, folder,"rgb", f_str)
+        # --- Hamlyn case: rectifiedXX/rectifiedXX/image01 ---
+        # You will use this with split lines like:
+        #   rectified11/rectified11/image01 0 l
+        #   rectified11/rectified11/image01 1 l
+        # i.e. `folder` is the directory, `frame_index` is the integer frame id.
+        if "rectified" in folder and "image01" in folder:
+            # 10-digit zero-padded filenames: 0000000000.png, 0000000001.png, ...
+            img_name = f"{int(frame_index):010d}.png"
+            return os.path.join(self.data_path, folder, img_name)
+
+        # --- Default: original SCARED/EndoVis behaviour ---
+        # Here `folder` is something like: dataset7/keyframe2
+        # and images live in: dataset7/keyframe2/data/370.png
+        img_name = "{:03d}.png".format(int(frame_index))
+        return os.path.join(self.data_path, folder, "data", img_name)
+
+    # def get_image_path(self, folder, frame_index, side):
+    #     #SCATER
+    #     f_str = "{}{}".format(frame_index, self.img_ext)
+    #     image_path = os.path.join(self.data_path, folder, "data", f_str)
+    #     #COLON10k
+
+    #     #f_str=str(frame_index) + self.img_ext
+    #     #image_path = os.path.join(self.data_path, folder,"rgb", f_str)
             
-        return image_path
+    #     return image_path
 
 class SCAREDRAWDataset(SCAREDDataset):
     def __init__(self, *args, **kwargs):
