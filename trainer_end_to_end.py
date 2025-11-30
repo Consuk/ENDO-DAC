@@ -138,7 +138,7 @@ class Trainer:
         train_filenames = readlines(fpath.format("train"))
         val_filenames = readlines(fpath.format("val"))
         test_filenames = readlines(fpath.format("test"))
-        img_ext = '.jpg'  
+        img_ext = '.png'  
 
         num_train_samples = len(train_filenames)
         self.num_total_steps = num_train_samples // self.opt.batch_size * self.opt.num_epochs
