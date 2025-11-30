@@ -104,21 +104,39 @@ class SCAREDRAWDataset(SCAREDDataset):
         super(SCAREDRAWDataset, self).__init__(*args, **kwargs)
 
     def get_image_path(self, folder, frame_index, side):
-        #SCATER
+        # SCATER
         # f_str = "{}{}".format(frame_index, self.img_ext)
         # image_path = os.path.join(self.data_path, folder, "data", f_str)
         
-        #COLON10k
-        #f_str=str(frame_index) + self.img_ext
-        #image_path = os.path.join(self.data_path, folder, f_str)
+        # COLON10k
+        # f_str = str(frame_index) + self.img_ext
+        # image_path = os.path.join(self.data_path, folder, f_str)
         
-        # Hamlyn
-        f_str = "{}{}".format(frame_index, self.img_ext)
-        image_path = os.path.join(self.data_path,folder, f_str)
+        # ---------------- Hamlyn ----------------
+        # We support two possible formats coming from the split:
+        #   1) folder = "rectified27/rectified27/image01"
+        #   2) folder = "rectified27/rectified27/image01/0000000811"
+        #
+        # In both cases, we want to end up with:
+        #   <data_path>/rectified27/rectified27/image01/0000000812.png
+        # where 0000000812 comes from `frame_index`.
+        if "rectified" in folder and "image01" in folder:
+            # If the last path component is a numeric string (like "0000000811"),
+            # treat it as a filename stub and strip it off.
+            last = os.path.basename(folder)
+            base_folder = folder
+            if last.isdigit():
+                base_folder = os.path.dirname(folder)
+
+            # Hamlyn uses 10-digit zero-padded filenames: 0000000000.png, ...
+            f_str = f"{int(frame_index):010d}{self.img_ext}"
+            image_path = os.path.join(self.data_path, base_folder, f_str)
         
-        #SERV-CT
-        #f_str = "{}{}".format(frame_index, self.img_ext)
-        #image_path = os.path.join(self.data_path,"SERV-CT",folder, f_str)
+        else:
+            # SERV-CT (and default SCARED/EndoVis behaviour)
+            f_str = "{}{}".format(frame_index, self.img_ext)
+            image_path = os.path.join(self.data_path, folder, "data", f_str)
+
         return image_path
 
     def get_depth(self, folder, frame_index, side, do_flip):
