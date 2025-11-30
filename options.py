@@ -68,7 +68,7 @@ class MonodepthOptions:
         self.parser.add_argument("--split",
                                  type=str,
                                  help="which training split to use",
-                                 choices=["endovis"],
+                                 choices=["endovis", "hamlyn", "c3vd"],
                                  default="endovis")
         self.parser.add_argument("--num_layers",
                                  type=int,
