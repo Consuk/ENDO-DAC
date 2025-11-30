@@ -138,10 +138,24 @@ class MonoDataset(data.Dataset):
         line = self.filenames[index].split()
         folder = line[0]
 
-        sequence = folder[7]
-        keyframe = folder[-1]
-        inputs["sequence"] = torch.from_numpy(np.array(int(sequence)))
-        inputs["keyframe"] = torch.from_numpy(np.array(int(keyframe)))
+        # ---- robust sequence / keyframe parsing (works for SCARED + Hamlyn) ----
+        digits = [int(ch) for ch in folder if ch.isdigit()]
+
+        if len(digits) >= 2:
+            sequence = digits[0]
+            keyframe = digits[1]
+        elif len(digits) == 1:
+            sequence = digits[0]
+            keyframe = 0
+        else:
+            # fallback if no digits found (shouldn't really happen)
+            sequence = 0
+            keyframe = 0
+
+        inputs["sequence"] = torch.from_numpy(np.array(sequence, dtype=np.int64))
+        inputs["keyframe"] = torch.from_numpy(np.array(keyframe, dtype=np.int64))
+        # ------------------------------------------------------------------------
+
         
         if len(line) == 3:
             frame_index = int(line[1])
