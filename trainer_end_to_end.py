@@ -138,7 +138,12 @@ class Trainer:
         train_filenames = readlines(fpath.format("train"))
         val_filenames = readlines(fpath.format("val"))
         test_filenames = readlines(fpath.format("test"))
-        img_ext = '.png'  
+        # after reading train/val/test filenames
+        if self.opt.split == "hamlyn":
+            img_ext = ".jpg"   # ✅
+        else:
+            img_ext = ".png"   # or whatever you used originally for EndoVis/SCARED
+
 
         num_train_samples = len(train_filenames)
         self.num_total_steps = num_train_samples // self.opt.batch_size * self.opt.num_epochs

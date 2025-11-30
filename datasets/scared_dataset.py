@@ -118,26 +118,27 @@ class SCAREDRAWDataset(SCAREDDataset):
         #   2) folder = "rectified27/rectified27/image01/0000000811"
         #
         # In both cases, we want to end up with:
-        #   <data_path>/rectified27/rectified27/image01/0000000812.png
+        #   <data_path>/rectified27/rectified27/image01/0000000812.jpg
         # where 0000000812 comes from `frame_index`.
         if "rectified" in folder and "image01" in folder:
             # If the last path component is a numeric string (like "0000000811"),
-            # treat it as a filename stub and strip it off.
+            # treat it as a filename stub and strip it off so `folder` is only the directory.
             last = os.path.basename(folder)
             base_folder = folder
             if last.isdigit():
                 base_folder = os.path.dirname(folder)
 
-            # Hamlyn uses 10-digit zero-padded filenames: 0000000000.png, ...
+            # Hamlyn uses 10-digit zero-padded filenames: 0000000000.jpg, ...
             f_str = f"{int(frame_index):010d}{self.img_ext}"
             image_path = os.path.join(self.data_path, base_folder, f_str)
-        
+
         else:
             # SERV-CT (and default SCARED/EndoVis behaviour)
             f_str = "{}{}".format(frame_index, self.img_ext)
             image_path = os.path.join(self.data_path, folder, "data", f_str)
 
         return image_path
+
 
     def get_depth(self, folder, frame_index, side, do_flip):
         f_str = "scene_points{:06d}.tiff".format(frame_index-1)
