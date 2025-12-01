@@ -261,7 +261,16 @@ class Trainer:
             "de/abs_rel", "de/sq_rel", "de/rmse", "de/log_rmse", "da/a1", "da/a2", "da/a3"]
 
         gt_path = os.path.join(splits_dir, self.opt.eval_split, "gt_depths.npz")
-        self.gt_depths = np.load(gt_path, fix_imports=True, encoding='latin1')["data"]
+        # self.gt_depths = np.load(gt_path, fix_imports=True, encoding='latin1')["data"]
+        #HAMLYN
+        gt_path = os.path.join(splits_dir, self.opt.eval_split, "gt_depths.npz")
+        self.gt_depths = np.load(
+            gt_path,
+            fix_imports=True,
+            encoding='latin1',
+            allow_pickle=True          
+        )["data"]
+
         
         print("Using split:\n  ", self.opt.split)
         print("There are {:d} training items, {:d} validation items and {:d} testing items\n".format(
