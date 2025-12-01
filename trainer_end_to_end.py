@@ -22,6 +22,9 @@ splits_dir = os.path.join(os.path.dirname(__file__), "splits")
 import wandb
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+_DEPTH_COLORMAP = cm.get_cmap("plasma")  # or "viridis", "magma", etc.
+
 
 def _to_rgb_image(t):
     # t: [3, H, W] in [0,1]
@@ -29,12 +32,32 @@ def _to_rgb_image(t):
     img = (np.clip(img, 0, 1) * 255).astype(np.uint8)
     return img
 
-def _to_depth_image(t):
-    # t: [H, W] or [1, H, W]
-    d = t.detach().cpu().squeeze().numpy()
-    d = d / (d.max() + 1e-8)         # normalize 0–1
-    cmap = plt.cm.magma(d)[..., :3]  # colormap to RGB
-    return (cmap * 255).astype(np.uint8)
+def _to_depth_image(depth_tensor):
+    """
+    Convert a [H, W] (or [1, H, W]) depth/disp tensor into a colored RGB image
+    for logging in W&B. Output is uint8 [H, W, 3] in 0–255.
+    """
+    depth = depth_tensor.detach().cpu().numpy()
+
+    # If it has shape (1, H, W), squeeze channel
+    if depth.ndim == 3:
+        depth = depth[0]
+
+    # Robust normalization (ignore extreme outliers)
+    vmin = np.percentile(depth, 5)
+    vmax = np.percentile(depth, 95)
+    if vmax <= vmin:
+        vmax = vmin + 1e-6
+
+    depth_norm = np.clip((depth - vmin) / (vmax - vmin), 0.0, 1.0)
+
+    # Apply colormap -> RGBA in [0,1], take RGB
+    colored = _DEPTH_COLORMAP(depth_norm)[..., :3]  # (H, W, 3)
+
+    # Convert to uint8 0–255 for wandb.Image
+    colored_img = (colored * 255).astype(np.uint8)
+    return colored_img
+
 
 def log(self, mode, inputs, outputs, losses):
     writer = self.writers[mode]
@@ -892,14 +915,11 @@ class Trainer:
 
                 # depth (if available)
                 if ("depth", 0, 0) in outputs:
-                    depth = outputs[("depth", 0, 0)][j, 0].detach().cpu().numpy()
-                    depth = depth / (depth.max() + 1e-8)
+                    depth = _to_depth_image(outputs[("depth", 0, 0)][j, 0])
                     log_dict[f"{mode}/depth"] = wandb.Image(depth)
 
-                # disparity (if available)
                 if ("disp", 0) in outputs:
-                    disp = outputs[("disp", 0)][j, 0].detach().cpu().numpy()
-                    disp = disp / (disp.max() + 1e-8)
+                    disp = _to_depth_image(outputs[("disp", 0)][j, 0])
                     log_dict[f"{mode}/disp"] = wandb.Image(disp)
 
             # intrinsics prediction K (if you are learning intrinsics)
