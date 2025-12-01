@@ -122,7 +122,13 @@ def export_gt_depths_kitti():
             gt_depths.append(gt_depth.astype(np.float32))
 
     print("Saving to {}".format(output_path))
-    np.savez_compressed(output_path, data=np.array(gt_depths))
+    # np.savez_compressed(output_path, data=np.array(gt_depths))
+    
+    # Some Hamlyn depth maps have different shapes (H, W),
+    # so we store them as an object array instead of forcing
+    # a single (N, H, W) tensor.
+    gt_depths_array = np.array(gt_depths, dtype=object)
+    np.savez_compressed(output_path, data=gt_depths_array)
 
 
 if __name__ == "__main__":
