@@ -19,6 +19,28 @@ from tensorboardX import SummaryWriter
 
 splits_dir = os.path.join(os.path.dirname(__file__), "splits")
 
+import wandb
+import numpy as np
+import matplotlib.pyplot as plt
+
+def _to_rgb_image(t):
+    # t: [3, H, W] in [0,1]
+    img = t.detach().cpu().permute(1, 2, 0).numpy()
+    img = (np.clip(img, 0, 1) * 255).astype(np.uint8)
+    return img
+
+def _to_depth_image(t):
+    # t: [H, W] or [1, H, W]
+    d = t.detach().cpu().squeeze().numpy()
+    d = d / (d.max() + 1e-8)         # normalize 0–1
+    cmap = plt.cm.magma(d)[..., :3]  # colormap to RGB
+    return (cmap * 255).astype(np.uint8)
+
+def log(self, mode, inputs, outputs, losses):
+    writer = self.writers[mode]
+    for l, v in losses.items():
+        writer.add_scalar("{}".format(l), v, self.step)
+
 class Trainer:
     def __init__(self, options):
         self.opt = options
@@ -816,81 +838,81 @@ class Trainer:
                                   sec_to_hm_str(time_sofar), sec_to_hm_str(training_time_left)))
 
     def log(self, mode, inputs, outputs, losses):
-        """Write an event to the tensorboard events file
-        """
+        """Write an event to the tensorboard events file + W&B"""
+        # ---------------- TensorBoard scalars ----------------
         writer = self.writers[mode]
         for l, v in losses.items():
             writer.add_scalar("{}".format(l), v, self.step)
-        
-        # ---- W&B scalar logging ----
-        if getattr(self, "use_wandb", False):
-            wandb_log_dict = {f"{mode}/{l}": float(v) for l, v in losses.items()}
-            wandb_log_dict["step"] = self.step
-            wandb.log(wandb_log_dict, step=self.step)
-        # ----------------------------
 
-        for j in range(min(4, self.opt.batch_size)):  # write a maxmimum of four images
+        # ---------------- TensorBoard images -----------------
+        for j in range(min(4, self.opt.batch_size)):  # write a maximum of four images
             for s in self.opt.scales:
                 for frame_id in self.opt.frame_ids[1:]:
 
                     writer.add_image(
                         "brightness_{}_{}/{}".format(frame_id, s, j),
-                        outputs[("transform", "high", s, frame_id)][j].data, self.step)
+                        outputs[("transform", "high", s, frame_id)][j].data,
+                        self.step)
+
                     writer.add_image(
                         "registration_{}_{}/{}".format(frame_id, s, j),
-                        outputs[("registration", s, frame_id)][j].data, self.step)
+                        outputs[("registration", s, frame_id)][j].data,
+                        self.step)
+
                     writer.add_image(
                         "refined_{}_{}/{}".format(frame_id, s, j),
-                        outputs[("refined", s, frame_id)][j].data, self.step)
+                        outputs[("refined", s, frame_id)][j].data,
+                        self.step)
+
                     if s == 0:
                         writer.add_image(
                             "occu_mask_backward_{}_{}/{}".format(frame_id, s, j),
-                            outputs[("occu_mask_backward", s, frame_id)][j].data, self.step)
-            
+                            outputs[("occu_mask_backward", s, frame_id)][j].data,
+                            self.step)
+
                 writer.add_image(
                     "disp_{}/{}".format(s, j),
-                    normalize_image(outputs[("disp", s)][j]), self.step)
-                # Existing TensorBoard image logging remains above...
-        # ---- W&B image logging (one sample) ----
-        if getattr(self, "use_wandb", False):
-            try:
-                # take the first sample in batch
-                j = 0
+                    normalize_image(outputs[("disp", s)][j]),
+                    self.step)
 
-                # 1) Input RGB (color, frame 0, scale 0)
-                if ("color", 0, 0) in inputs:
-                    color = inputs[("color", 0, 0)][j].detach().cpu()  # CxHxW
-                    color_np = (color.permute(1, 2, 0).numpy() * 255.0).clip(0, 255).astype(np.uint8)
-                else:
-                    color_np = None
+        # ---------------------- W&B --------------------------
+        if getattr(self.opt, "use_wandb", False):
+            # scalars
+            log_dict = {f"{mode}/{l}": float(v) for l, v in losses.items()}
 
-                # 2) Predicted depth at scale 0
-                # `generate_images_pred` already stored it as outputs[("depth", 0, 0)]
+            # images every log_frequency steps
+            if self.step % self.opt.log_frequency == 0:
+                j = 0  # first element of the batch
+
+                # RGB
+                rgb = inputs[("color", 0, 0)][j].detach().cpu()
+                rgb = rgb.permute(1, 2, 0).clamp(0, 1).numpy()
+                rgb = (rgb * 255).astype("uint8")
+                log_dict[f"{mode}/rgb"] = wandb.Image(rgb)
+
+                # depth (if available)
                 if ("depth", 0, 0) in outputs:
-                    depth = outputs[("depth", 0, 0)][j, 0].detach().cpu().numpy()  # HxW
+                    depth = outputs[("depth", 0, 0)][j, 0].detach().cpu().numpy()
+                    depth = depth / (depth.max() + 1e-8)
+                    log_dict[f"{mode}/depth"] = wandb.Image(depth)
 
-                    d_min = depth.min()
-                    d_max = depth.max()
-                    depth_norm = (depth - d_min) / (d_max - d_min + 1e-7)  # 0-1
+                # disparity (if available)
+                if ("disp", 0) in outputs:
+                    disp = outputs[("disp", 0)][j, 0].detach().cpu().numpy()
+                    disp = disp / (disp.max() + 1e-8)
+                    log_dict[f"{mode}/disp"] = wandb.Image(disp)
 
-                else:
-                    depth_norm = None
+            # intrinsics prediction K (if you are learning intrinsics)
+            if getattr(self.opt, "learn_intrinsics", False) and ("K", 0) in outputs:
+                K = outputs[("K", 0)][0].detach().cpu().numpy()  # first in batch
+                log_dict[f"{mode}/K_fx"] = float(K[0, 0])
+                log_dict[f"{mode}/K_fy"] = float(K[1, 1])
+                log_dict[f"{mode}/K_cx"] = float(K[0, 2])
+                log_dict[f"{mode}/K_cy"] = float(K[1, 2])
 
-                wandb_images = {}
+            wandb.log(log_dict, step=self.step)
+        # ------------------------------------------------------
 
-                if color_np is not None:
-                    wandb_images[f"{mode}/rgb"] = wandb.Image(color_np, caption=f"{mode} RGB step {self.step}")
-
-                if depth_norm is not None:
-                    wandb_images[f"{mode}/depth"] = wandb.Image(depth_norm, caption=f"{mode} depth step {self.step}")
-
-                if len(wandb_images) > 0:
-                    wandb.log(wandb_images, step=self.step)
-
-            except Exception as e:
-                # Don't crash training if logging fails
-                print(f"[W&B] Failed to log images at step {self.step}: {e}")
-        # ----------------------------------------
 
 
     def save_opts(self):
