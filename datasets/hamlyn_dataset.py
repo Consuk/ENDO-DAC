@@ -75,8 +75,19 @@ class HamlynDataset(data.Dataset):
         
         self.long_rectified_files = ["rectified14", "rectified14", "rectified14", "rectified14"]
         self.scans = []
-        self.rectified_files = [os.path.join(self.data_path, file) for file in os.listdir(self.data_path)]
-        self.rectified_files.sort()
+        rectified_candidates = [os.path.join(self.data_path, file)
+                        for file in os.listdir(self.data_path)]
+        rectified_candidates.sort()
+
+        self.rectified_files = []
+        for rc in rectified_candidates:
+            base = os.path.basename(rc)
+            inner = os.path.join(rc, base)
+            # If there's a nested folder with the same name, use that
+            if os.path.isdir(inner):
+                self.rectified_files.append(inner)
+            else:
+                self.rectified_files.append(rc)
         self.long_rectified_files = self.rectified_files[7:]
         self.sequence_len = np.zeros([len(self.rectified_files)])
         for i, rectified_file in enumerate(self.rectified_files):
