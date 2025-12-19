@@ -296,3 +296,7 @@ def evaluate(opt):
     print("\n       " + ("{:>11}      | " * 7).format("abs_rel", "sq_rel", "rmse", "rmse_log", "a1", "a2", "a3"))
     print("mean:" + ("&{: 12.3f}      " * 7).format(*mean_errors.tolist()) + "\\\\")
     print("\n-> Done!")
+
+if __name__ == "__main__":
+    options = MonodepthOptions()
+    evaluate(options.parse())
