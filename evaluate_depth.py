@@ -2,147 +2,159 @@ from __future__ import absolute_import, division, print_function
 
 import os
 import cv2
+import time
 import numpy as np
 from tqdm import tqdm
-import time
+from PIL import Image
 
 import torch
-from torch.utils.data import DataLoader
-from PIL import Image
-import matplotlib
+from torch.utils.data import DataLoader, Dataset
+import torchvision.transforms as T
+
 import scipy.stats as st
 
 from utils.layers import disp_to_depth
 from utils.utils import readlines, compute_errors
 from options import MonodepthOptions
+
 from datasets.scared_dataset import SCAREDRAWDataset
-from datasets.hamlyn_dataset import HamlynDataset
-import datasets
+# NOTE: We intentionally do NOT use ENDO-DAC's HamlynDataset for Hamlyn split anymore,
+# because it scans the whole dataset and ignores test_files.txt.
+
 import models.encoders as encoders
 import models.decoders as decoders
 import models.endodac as endodac
 
-cv2.setNumThreads(0)  # This speeds up evaluation 5x on our unix systems (OpenCV 3.3.1)
 
-
+cv2.setNumThreads(0)
 splits_dir = os.path.join(os.path.dirname(__file__), "splits")
 
-def render_depth(disp):
-    disp = (disp - disp.min()) / (disp.max() - disp.min()) * 255.0
-    disp = disp.astype(np.uint8)
-    disp_color = cv2.applyColorMap(disp, cv2.COLORMAP_INFERNO)
-    return disp_color
 
-
-def batch_post_process_disparity(l_disp, r_disp):
-    """Apply the disparity post-processing method as introduced in Monodepthv1
+# -------------------------
+# Hamlyn Split Dataset (A-logic)
+# -------------------------
+class HamlynSplitDataset(Dataset):
     """
-    _, h, w = l_disp.shape
-    m_disp = 0.5 * (l_disp + r_disp)
-    l, _ = np.meshgrid(np.linspace(0, 1, w), np.linspace(0, 1, h))
-    l_mask = (1.0 - np.clip(20 * (l - 0.05), 0, 1))[None, ...]
-    r_mask = l_mask[:, :, ::-1]
-    return r_mask * l_disp + l_mask * r_disp + (1.0 - l_mask - r_mask) * m_disp
+    A minimal dataset that:
+    - reads frames from splits/hamlyn/test_files.txt
+    - loads ONLY left image (image01) as ("color",0,0)
+    - resizes to (height,width)
+    This ensures:
+    - dataset length matches your split txt (e.g., ~1701)
+    - batching works without collate issues
+    """
+    def __init__(self, data_path, filenames, height, width, img_ext=".jpg"):
+        self.data_path = data_path
+        self.filenames = [l.strip() for l in filenames if len(l.strip()) > 0]
+        self.height = height
+        self.width = width
+        self.img_ext = img_ext
+
+        self.to_tensor = T.ToTensor()
+
+    def __len__(self):
+        return len(self.filenames)
+
+    def _resolve_left_image_path(self, line):
+        """
+        Supports multiple possible formats in test_files.txt.
+
+        Common possible formats:
+        1) "<relative_path_to_image>" (already points to an image file)
+        2) "<sequence_or_folder> <frame_id>" (Monodepth style)
+           We'll try to build something like:
+           - data_path/<seq>/<frame>.jpg
+           - data_path/<seq>/image01/<frame>.jpg
+           - data_path/<seq>/<seq>/image01/<frame>.jpg  (Hamlyn rectifiedXX/rectifiedXX/image01)
+        3) "<seq>/<seq> <frame_id>"
+        """
+        parts = line.split()
+
+        # Case 1: single token
+        if len(parts) == 1:
+            rel = parts[0]
+            # If it already ends with image extension, use directly
+            if rel.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")):
+                p = os.path.join(self.data_path, rel)
+                if os.path.exists(p):
+                    return p
+
+            # Otherwise attempt to interpret as folder/frame without id -> not possible
+            # Fallthrough: treat as folder and try frame=0000000000
+            seq = rel
+            frame = "0000000000"
+        else:
+            seq, frame = parts[0], parts[1]
+
+        # Ensure frame has extension
+        if not frame.lower().endswith((".jpg", ".jpeg", ".png")):
+            frame_file = frame + self.img_ext
+        else:
+            frame_file = frame
+
+        # Build candidates (try multiple)
+        candidates = [
+            os.path.join(self.data_path, seq, frame_file),
+            os.path.join(self.data_path, seq, "image01", frame_file),
+            os.path.join(self.data_path, seq, seq, "image01", frame_file),
+            os.path.join(self.data_path, seq, seq, "image_1", frame_file),
+            os.path.join(self.data_path, seq, "rectified01", frame_file),
+        ]
+
+        for p in candidates:
+            if os.path.exists(p):
+                return p
+
+        # If nothing found, raise a clear error
+        raise FileNotFoundError(
+            f"[HamlynSplitDataset] Could not resolve image path from line='{line}'. "
+            f"Tried: {candidates}"
+        )
+
+    def __getitem__(self, idx):
+        line = self.filenames[idx]
+        img_path = self._resolve_left_image_path(line)
+
+        img = Image.open(img_path).convert("RGB")
+        img = img.resize((self.width, self.height), resample=Image.BILINEAR)
+        img_t = self.to_tensor(img)  # (3,H,W), float [0,1]
+
+        # Return monodepth-style key
+        return {
+            ("color", 0, 0): img_t,
+        }
+
+
+def load_gt_depths_npz(eval_split):
+    gt_path = os.path.join(splits_dir, eval_split, "gt_depths.npz")
+    data_npz = np.load(gt_path, fix_imports=True, encoding='latin1', allow_pickle=True)
+    gt_depths = data_npz["data"]
+    if isinstance(gt_depths, np.ndarray) and gt_depths.dtype == object:
+        gt_depths = list(gt_depths)
+    return gt_depths
+
 
 def evaluate(opt):
-    """
-    Evaluation B file, but using Evaluation A logic:
-    - build dataset from splits/<split>/test_files.txt
-    - load gt_depths from splits/<split>/gt_depths.npz (object array supported)
-    - run inference -> collect pred_disps -> evaluate after
-    """
-    import wandb
-    import matplotlib.pyplot as plt
-
     MIN_DEPTH = 1e-3
     MAX_DEPTH = 150
 
     assert sum((opt.eval_mono, opt.eval_stereo)) == 1, \
-        "Please choose mono or stereo evaluation by setting either --eval_mono or --eval_stereo"
+        "Choose mono or stereo with --eval_mono or --eval_stereo"
 
     # ----------------------------
-    # A-style: init wandb (optional)
-    # ----------------------------
-    if getattr(opt, "wandb", False):
-        wandb.init(project=getattr(opt, "wandb_project", "iilDepth-Testing"))
-
-    _DEPTH_COLORMAP = plt.get_cmap('plasma', 256)
-
-    def colormap(inputs, normalize=True):
-        if isinstance(inputs, torch.Tensor):
-            inputs = inputs.detach().cpu().numpy()
-        vis = inputs
-        if normalize:
-            ma = float(vis.max())
-            mi = float(vis.min())
-            d = ma - mi if ma != mi else 1e5
-            vis = (vis - mi) / d
-
-        if vis.ndim == 2:
-            vis = _DEPTH_COLORMAP(vis)[..., :3]  # H,W,3
-        return vis
-
-    # ----------------------------
-    # A-style: load weights / set depther
+    # Model loading (ENDO-DAC / B)
     # ----------------------------
     if opt.ext_disp_to_eval is None:
-        if not opt.model_type == 'depthanything':
-            opt.load_weights_folder = os.path.expanduser(opt.load_weights_folder)
-            assert os.path.isdir(opt.load_weights_folder), \
-                "Cannot find a folder at {}".format(opt.load_weights_folder)
-            print("-> Loading weights from {}".format(opt.load_weights_folder))
-        else:
-            print("Evaluating Depth Anything model")
+        opt.load_weights_folder = os.path.expanduser(opt.load_weights_folder)
+        assert os.path.isdir(opt.load_weights_folder), \
+            f"Cannot find folder: {opt.load_weights_folder}"
+
+        print(f"-> Loading weights from {opt.load_weights_folder}")
 
         if opt.model_type == 'endodac':
             depther_path = os.path.join(opt.load_weights_folder, "depth_model.pth")
-            depther_dict = torch.load(depther_path)
-        elif opt.model_type == 'afsfm':
-            encoder_path = os.path.join(opt.load_weights_folder, "encoder.pth")
-            decoder_path = os.path.join(opt.load_weights_folder, "depth.pth")
-            encoder_dict = torch.load(encoder_path)
+            depther_dict = torch.load(depther_path, map_location="cpu")
 
-        # ----------------------------
-        # A-style: filenames from test_files.txt
-        # ----------------------------
-        filenames = readlines(os.path.join(splits_dir, opt.eval_split, "test_files.txt"))
-
-        # A-style dataset build (Hamlyn requires filenames list)
-        if opt.eval_split == 'endovis':
-            dataset = SCAREDRAWDataset(
-                opt.data_path, filenames,
-                opt.height, opt.width,
-                [0], 4, is_train=False
-            )
-        elif opt.eval_split == 'hamlyn':
-            dataset = HamlynDataset(
-                opt.data_path,
-                opt.height, opt.width,
-                [0], 4,
-                is_train=False
-            )
-
-        elif opt.eval_split == 'c3vd':
-            dataset = C3VDDataset(
-                opt.data_path, filenames,
-                opt.height, opt.width,
-                [0], 4, is_train=False
-            )
-            MAX_DEPTH = 100
-        else:
-            raise ValueError(f"Unknown eval_split: {opt.eval_split}")
-
-        # A-style batching (faster than B’s batch=1)
-        dataloader = DataLoader(
-            dataset,
-            batch_size=getattr(opt, "eval_batch_size", 16),
-            shuffle=False,
-            num_workers=opt.num_workers,
-            pin_memory=True,
-            drop_last=False
-        )
-
-        if opt.model_type == 'endodac':
             depther = endodac.endodac(
                 backbone_size="base",
                 r=opt.lora_rank, lora_type=opt.lora_type,
@@ -152,93 +164,117 @@ def evaluate(opt):
                 include_cls_token=opt.include_cls_token
             )
             model_dict = depther.state_dict()
-            depther.load_state_dict({k: v for k, v in depther_dict.items() if k in model_dict})
+            depther.load_state_dict({k: v for k, v in depther_dict.items() if k in model_dict}, strict=False)
             depther.cuda().eval()
 
         elif opt.model_type == 'afsfm':
+            encoder_path = os.path.join(opt.load_weights_folder, "encoder.pth")
+            decoder_path = os.path.join(opt.load_weights_folder, "depth.pth")
+            encoder_dict = torch.load(encoder_path, map_location="cpu")
+
             encoder = encoders.ResnetEncoder(opt.num_layers, False)
             depth_decoder = decoders.DepthDecoder(encoder.num_ch_enc, scales=range(4))
+
             model_dict = encoder.state_dict()
-            encoder.load_state_dict({k: v for k, v in encoder_dict.items() if k in model_dict})
-            depth_decoder.load_state_dict(torch.load(decoder_path))
+            encoder.load_state_dict({k: v for k, v in encoder_dict.items() if k in model_dict}, strict=False)
+            depth_decoder.load_state_dict(torch.load(decoder_path, map_location="cpu"))
+
             encoder.cuda().eval()
             depth_decoder.cuda().eval()
 
             def depther(image):
                 return depth_decoder(encoder(image))
 
+        else:
+            raise ValueError("You must set --model_type endodac or --model_type afsfm")
+
     else:
-        # A-style: load predicted disparities directly
-        print("-> Loading predictions from {}".format(opt.ext_disp_to_eval))
+        print(f"-> Loading predictions from {opt.ext_disp_to_eval}")
         pred_disps = np.load(opt.ext_disp_to_eval)
 
-        # Still need dataloader only for image ordering sanity (optional)
-        filenames = readlines(os.path.join(splits_dir, opt.eval_split, "test_files.txt"))
-        if opt.eval_split == 'endovis':
-            dataset = SCAREDRAWDataset(opt.data_path, filenames, opt.height, opt.width, [0], 4, is_train=False)
-        elif opt.eval_split == 'hamlyn':
-            dataset = HamlynDataset(opt.data_path, filenames, opt.height, opt.width, [0], 4, is_train=False)
-        elif opt.eval_split == 'c3vd':
-            dataset = C3VDDataset(opt.data_path, filenames, opt.height, opt.width, [0], 4, is_train=False)
-            MAX_DEPTH = 100
-        else:
-            raise ValueError(f"Unknown eval_split: {opt.eval_split}")
+    # ----------------------------
+    # Dataset (A-logic for Hamlyn)
+    # ----------------------------
+    img_ext = ".png" if opt.png else ".jpg"
 
-        dataloader = DataLoader(dataset, batch_size=1, shuffle=False,
-                                num_workers=opt.num_workers, pin_memory=True, drop_last=False)
+    if opt.eval_split == "hamlyn":
+        split_file = os.path.join(splits_dir, "hamlyn", "test_files.txt")
+        assert os.path.exists(split_file), f"Missing split file: {split_file}"
+        filenames = readlines(split_file)
+
+        dataset = HamlynSplitDataset(
+            data_path=opt.data_path,
+            filenames=filenames,
+            height=opt.height,
+            width=opt.width,
+            img_ext=img_ext
+        )
+
+        # Safe batching (dataset returns only fixed-size tensors)
+        batch_size = getattr(opt, "eval_batch_size", 16)
+        dataloader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=opt.num_workers,
+            pin_memory=True,
+            drop_last=False
+        )
+
+        # Load A-style GT
+        gt_depths = load_gt_depths_npz("hamlyn")
+
+    elif opt.eval_split == "endovis":
+        # keep B behavior (dataset provides ordering)
+        filenames = readlines(os.path.join(splits_dir, "endovis", "test_files.txt"))
+        dataset = SCAREDRAWDataset(opt.data_path, filenames, opt.height, opt.width, [0], 4, is_train=False)
+        dataloader = DataLoader(dataset, 1, shuffle=False, num_workers=opt.num_workers,
+                                pin_memory=True, drop_last=False)
+
+        gt_depths = load_gt_depths_npz("endovis")
+
+    else:
+        raise ValueError("This script currently supports --eval_split hamlyn or endovis (A-logic version).")
 
     # ----------------------------
-    # A-style: compute predictions first (unless ext_disp_to_eval)
+    # Predictions (A-style: predict first)
     # ----------------------------
+    inference_times = []
     if opt.ext_disp_to_eval is None:
+        print(f"-> Computing predictions with size {opt.width}x{opt.height}")
         pred_disps_list = []
-        print("-> Computing predictions with size {}x{}".format(opt.width, opt.height))
 
         with torch.no_grad():
-            for step_i, data in enumerate(dataloader):
+            for step_i, data in tqdm(enumerate(dataloader), total=len(dataloader)):
                 input_color = data[("color", 0, 0)].cuda()
 
                 if opt.post_process:
                     input_color = torch.cat((input_color, torch.flip(input_color, [3])), 0)
 
+                t0 = time.time()
                 output = depther(input_color)
+                inference_times.append(time.time() - t0)
 
-                # A/B compatibility: pick correct key
-                if isinstance(output, dict) and ("disp", 0) in output:
-                    output_disp = output[("disp", 0)]
-                elif isinstance(output, dict) and ("disp", 0) in output:
-                    output_disp = output[("disp", 0)]
-                else:
-                    # If your model returns something different, adjust here
-                    output_disp = output[("disp", 0)]
+                if not isinstance(output, dict) or ("disp", 0) not in output:
+                    raise RuntimeError("Model output does not contain ('disp',0).")
 
-                pred_disp, _ = disp_to_depth(output_disp, opt.min_depth, opt.max_depth)
+                pred_disp, _ = disp_to_depth(output[("disp", 0)], opt.min_depth, opt.max_depth)
                 pred_disp = pred_disp.cpu()[:, 0].numpy()  # (B,H,W)
 
-                # NOTE: A had post_process code commented out; keep same behavior:
-                # (do nothing even if post_process True)
-
+                # A-style: do NOT apply batch_post_process_disparity even if post_process True (matches your A)
                 pred_disps_list.append(pred_disp)
 
-        pred_disps = np.concatenate(pred_disps_list, axis=0)  # (N,H,W)
+        pred_disps = np.concatenate(pred_disps_list, axis=0)
 
     # ----------------------------
-    # A-style: load gt_depths from NPZ (CRITICAL for Hamlyn A-logic)
+    # Sanity: pred count vs GT count
     # ----------------------------
-    gt_path = os.path.join(splits_dir, opt.eval_split, "gt_depths.npz")
-    data_npz = np.load(gt_path, fix_imports=True, encoding='latin1', allow_pickle=True)
-    gt_depths = data_npz["data"]
-
-    # Hamlyn commonly uses object arrays (variable shapes)
-    if isinstance(gt_depths, np.ndarray) and gt_depths.dtype == object:
-        gt_depths = list(gt_depths)
-
-    print("-> Loaded gt_depths. num_gt =", len(gt_depths), "num_pred =", pred_disps.shape[0])
+    print(f"-> num_pred: {pred_disps.shape[0]} | num_gt: {len(gt_depths)}")
     assert pred_disps.shape[0] == len(gt_depths), \
         f"Mismatch: {pred_disps.shape[0]} predictions vs {len(gt_depths)} gt depth maps"
 
     # ----------------------------
-    # A-style scaling rules
+    # Scaling mode
     # ----------------------------
     if opt.eval_stereo:
         print("   Stereo evaluation - disabling median scaling")
@@ -246,56 +282,72 @@ def evaluate(opt):
     else:
         print("   Mono evaluation - using median scaling")
 
+    # ----------------------------
+    # Evaluate (A-style: eval after)
+    # ----------------------------
     errors = []
     ratios = []
 
-    # ----------------------------
-    # A-style: evaluate after predictions
-    # ----------------------------
     for i in range(pred_disps.shape[0]):
         gt_depth = gt_depths[i]
-        gt_height, gt_width = gt_depth.shape[:2]
+        gt_h, gt_w = gt_depth.shape[:2]
 
         pred_disp = pred_disps[i]
-
-        # A-style: optional W&B disparity visualization
-        if getattr(opt, "wandb", False):
-            disp_vis = colormap(pred_disp, normalize=True)  # H,W,3 float
-            wandb.log({"disp_testing": wandb.Image((disp_vis * 255).astype(np.uint8))}, step=i)
-
-        pred_disp = cv2.resize(pred_disp, (gt_width, gt_height))
+        pred_disp = cv2.resize(pred_disp, (gt_w, gt_h))
         pred_depth = 1.0 / pred_disp
 
         mask = np.logical_and(gt_depth > MIN_DEPTH, gt_depth < MAX_DEPTH)
 
         pred_depth = pred_depth[mask]
-        gt_depth_valid = gt_depth[mask]
+        gt_valid = gt_depth[mask]
 
-        # NOTE: A did NOT apply pred_depth_scale_factor here.
-        # If you want it identical to A, leave it out.
-        # If you want B behavior, uncomment next line:
+        # IMPORTANT:
+        # A-logic: do NOT apply pred_depth_scale_factor here.
+        # (If you want B behavior, uncomment next line)
         # pred_depth *= opt.pred_depth_scale_factor
 
         if not opt.disable_median_scaling:
-            ratio = np.median(gt_depth_valid) / np.median(pred_depth)
+            ratio = np.median(gt_valid) / np.median(pred_depth)
             ratios.append(ratio)
             pred_depth *= ratio
 
         pred_depth[pred_depth < MIN_DEPTH] = MIN_DEPTH
         pred_depth[pred_depth > MAX_DEPTH] = MAX_DEPTH
 
-        errors.append(compute_errors(gt_depth_valid, pred_depth))
+        err = compute_errors(gt_valid, pred_depth)
+        errors.append(err)
 
     if not opt.disable_median_scaling:
         ratios = np.array(ratios)
         med = np.median(ratios)
         print(" Scaling ratios | med: {:0.3f} | std: {:0.3f}".format(med, np.std(ratios / med)))
 
-    mean_errors = np.array(errors).mean(0)
+    errors = np.array(errors)
+    mean_errors = np.mean(errors, axis=0)
+
+    # Confidence intervals (keep B feature)
+    cls = []
+    for k in range(len(mean_errors)):
+        cl = st.t.interval(alpha=0.95, df=len(errors) - 1,
+                           loc=mean_errors[k], scale=st.sem(errors[:, k]))
+        cls.append(cl[0])
+        cls.append(cl[1])
+    cls = np.array(cls)
+
     print("\n       " + ("{:>11}      | " * 7).format("abs_rel", "sq_rel", "rmse", "rmse_log", "a1", "a2", "a3"))
     print("mean:" + ("&{: 12.3f}      " * 7).format(*mean_errors.tolist()) + "\\\\")
+    print("cls: " + ("& [{: 6.3f}, {: 6.3f}] " * 7).format(*cls.tolist()) + "\\\\")
+    if len(inference_times) > 0:
+        print("average inference time: {:0.1f} ms".format(np.mean(np.array(inference_times)) * 1000))
     print("\n-> Done!")
+
 
 if __name__ == "__main__":
     options = MonodepthOptions()
-    evaluate(options.parse())
+    opt = options.parse()
+
+    # Sensible default if your options don’t define model_type
+    if not hasattr(opt, "model_type") or opt.model_type is None:
+        opt.model_type = "endodac"  # change if needed
+
+    evaluate(opt)
