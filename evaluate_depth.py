@@ -115,14 +115,13 @@ def evaluate(opt):
                 [0], 4, is_train=False
             )
         elif opt.eval_split == 'hamlyn':
-            # IMPORTANT: this must be the HamlynDataset signature that accepts filenames
-            # If your HamlynDataset in this repo DOES NOT accept filenames,
-            # see section "If your HamlynDataset signature differs" below.
             dataset = HamlynDataset(
-                opt.data_path, filenames,
+                opt.data_path,
                 opt.height, opt.width,
-                [0], 4, is_train=False
+                [0], 4,
+                is_train=False
             )
+
         elif opt.eval_split == 'c3vd':
             dataset = C3VDDataset(
                 opt.data_path, filenames,
