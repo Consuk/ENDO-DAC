@@ -57,59 +57,80 @@ class HamlynSplitDataset(Dataset):
 
     def _resolve_left_image_path(self, line):
         """
-        Supports multiple possible formats in test_files.txt.
+        Supports Hamlyn split lines like:
+        rectified05/rectified05/image01 1 l
 
-        Common possible formats:
-        1) "<relative_path_to_image>" (already points to an image file)
-        2) "<sequence_or_folder> <frame_id>" (Monodepth style)
-           We'll try to build something like:
-           - data_path/<seq>/<frame>.jpg
-           - data_path/<seq>/image01/<frame>.jpg
-           - data_path/<seq>/<seq>/image01/<frame>.jpg  (Hamlyn rectifiedXX/rectifiedXX/image01)
-        3) "<seq>/<seq> <frame_id>"
+        where:
+        parts[0] = folder path (already includes image01 or image02)
+        parts[1] = frame index (needs zero padding)
+        parts[2] = 'l' or 'r'
         """
-        parts = line.split()
+        parts = line.strip().split()
+        if len(parts) >= 3:
+            folder_rel = parts[0]
+            frame_raw = parts[1]
+            side = parts[2].lower()
 
-        # Case 1: single token
-        if len(parts) == 1:
-            rel = parts[0]
-            # If it already ends with image extension, use directly
-            if rel.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")):
-                p = os.path.join(self.data_path, rel)
+            # Force left only: if split file contains 'r', you can skip or redirect.
+            # Here we redirect to left folder if possible.
+            if side not in ["l", "r"]:
+                side = "l"
+
+            # Frame id -> 10-digit filename
+            try:
+                frame_id = int(frame_raw)
+                frame_file = f"{frame_id:010d}{self.img_ext}"
+            except ValueError:
+                # If it already looks like 0000000001.jpg
+                if frame_raw.lower().endswith((".jpg", ".jpeg", ".png")):
+                    frame_file = frame_raw
+                else:
+                    frame_file = frame_raw + self.img_ext
+
+            # If folder already points to image01, use it directly
+            p1 = os.path.join(self.data_path, folder_rel, frame_file)
+
+            # If it's right folder or ambiguous, try replacing image02/image_right -> image01
+            folder_left = folder_rel.replace("image02", "image01").replace("image_right", "image01")
+            p2 = os.path.join(self.data_path, folder_left, frame_file)
+
+            # Also handle case where folder_rel might end at rectifiedXX/rectifiedXX (without image01)
+            p3 = os.path.join(self.data_path, folder_rel, "image01", frame_file)
+
+            candidates = [p1, p2, p3]
+            for p in candidates:
                 if os.path.exists(p):
                     return p
 
-            # Otherwise attempt to interpret as folder/frame without id -> not possible
-            # Fallthrough: treat as folder and try frame=0000000000
-            seq = rel
-            frame = "0000000000"
-        else:
+            raise FileNotFoundError(
+                f"[HamlynSplitDataset] Could not resolve image path from line='{line}'. "
+                f"Tried: {candidates}"
+            )
+
+        # Fallback: older formats
+        if len(parts) == 2:
             seq, frame = parts[0], parts[1]
+            frame_id = int(frame)
+            frame_file = f"{frame_id:010d}{self.img_ext}"
+            candidates = [
+                os.path.join(self.data_path, seq, frame_file),
+                os.path.join(self.data_path, seq, "image01", frame_file),
+            ]
+            for p in candidates:
+                if os.path.exists(p):
+                    return p
+            raise FileNotFoundError(f"Could not resolve image for '{line}', tried {candidates}")
 
-        # Ensure frame has extension
-        if not frame.lower().endswith((".jpg", ".jpeg", ".png")):
-            frame_file = frame + self.img_ext
-        else:
-            frame_file = frame
-
-        # Build candidates (try multiple)
-        candidates = [
-            os.path.join(self.data_path, seq, frame_file),
-            os.path.join(self.data_path, seq, "image01", frame_file),
-            os.path.join(self.data_path, seq, seq, "image01", frame_file),
-            os.path.join(self.data_path, seq, seq, "image_1", frame_file),
-            os.path.join(self.data_path, seq, "rectified01", frame_file),
-        ]
-
-        for p in candidates:
+        # Single token: direct relative path
+        if len(parts) == 1:
+            rel = parts[0]
+            p = os.path.join(self.data_path, rel)
             if os.path.exists(p):
                 return p
+            raise FileNotFoundError(f"Could not resolve image for '{line}', tried {p}")
 
-        # If nothing found, raise a clear error
-        raise FileNotFoundError(
-            f"[HamlynSplitDataset] Could not resolve image path from line='{line}'. "
-            f"Tried: {candidates}"
-        )
+        raise FileNotFoundError(f"Unrecognized split line format: '{line}'")
+
 
     def __getitem__(self, idx):
         line = self.filenames[idx]
