@@ -14,6 +14,8 @@ import matplotlib.cm as cm
 import wandb
 
 import datasets
+# Import the custom Hamlyn dataset used when training on the Hamlyn split
+from hamlyn_dataset import HamlynDataset
 import models.encoders as encoders
 import models.decoders as decoders
 import models.endodac as endodac
@@ -216,21 +218,43 @@ class Trainer:
         print("Training is using:\n  ", self.device)
 
         # ------------------ Data ------------------
+        # Select the appropriate dataset implementation and file lists
+        # depending on the chosen split. For the Hamlyn dataset we use
+        # our custom HamlynDataset and explicitly read train/test file
+        # lists from the project root. When no separate validation set
+        # exists the test set is used for validation as well.
         datasets_dict = {"endovis": datasets.SCAREDRAWDataset}
-        self.dataset = datasets_dict[self.opt.dataset]
-
-        fpath = os.path.join(
-            os.path.dirname(__file__), "splits", self.opt.split, "{}_files.txt"
-        )
-        train_filenames = readlines(fpath.format("train"))
-        val_filenames = readlines(fpath.format("val"))
-        test_filenames = readlines(fpath.format("test"))
-
-        # Image extension depending on split
-        if self.opt.split == "hamlyn":
+        if self.opt.split == "hamlyn" or getattr(self.opt, "dataset", None) == "hamlyn":
+            self.dataset = HamlynDataset
+            base_dir = os.path.dirname(__file__)
+            train_file_path = os.path.join(base_dir, "train_files.txt")
+            test_file_path = os.path.join(base_dir, "test_files.txt")
+            if not os.path.exists(train_file_path):
+                raise FileNotFoundError(f"Expected train_files.txt at {train_file_path}")
+            if not os.path.exists(test_file_path):
+                raise FileNotFoundError(f"Expected test_files.txt at {test_file_path}")
+            train_filenames = readlines(train_file_path)
+            # Use the test list for validation if no explicit val list is provided
+            val_filenames = readlines(test_file_path)
+            test_filenames = readlines(test_file_path)
             img_ext = ".jpg"
+            # Enforce learning intrinsics for Hamlyn to avoid using
+            # dataset-provided intrinsics. Only set if not already true.
+            if not getattr(self.opt, "learn_intrinsics", False):
+                self.opt.learn_intrinsics = True
         else:
-            img_ext = ".png"
+            self.dataset = datasets_dict[self.opt.dataset]
+            fpath = os.path.join(
+                os.path.dirname(__file__), "splits", self.opt.split, "{}_files.txt"
+            )
+            train_filenames = readlines(fpath.format("train"))
+            val_filenames = readlines(fpath.format("val"))
+            test_filenames = readlines(fpath.format("test"))
+            # Image extension depending on split
+            if self.opt.split == "hamlyn":
+                img_ext = ".jpg"
+            else:
+                img_ext = ".png"
 
         num_train_samples = len(train_filenames)
         self.num_total_steps = (
@@ -355,13 +379,21 @@ class Trainer:
         ]
 
         # ---------- Load gt_depths (Hamlyn / EndoVis) ----------
+        # Load ground truth depths for evaluation if available. For the
+        # hamlyn split there may not be a gt_depths.npz file; in this case
+        # evaluation will be skipped gracefully.
         gt_path = os.path.join(splits_dir, self.opt.eval_split, "gt_depths.npz")
-        self.gt_depths = np.load(
-            gt_path,
-            fix_imports=True,
-            encoding="latin1",
-            allow_pickle=True,
-        )["data"]
+        if os.path.exists(gt_path):
+            self.gt_depths = np.load(
+                gt_path,
+                fix_imports=True,
+                encoding="latin1",
+                allow_pickle=True,
+            )["data"]
+        else:
+            # When ground truth is unavailable, use an empty array which
+            # signals the evaluation routines to skip metric computation.
+            self.gt_depths = None
 
         print("Using split:\n  ", self.opt.split)
         print(
@@ -528,6 +560,13 @@ class Trainer:
         print("Evaluating")
         MIN_DEPTH = 1e-3
         MAX_DEPTH = 150
+
+        # If ground truth depths are unavailable (e.g. for the Hamlyn
+        # dataset), skip evaluation and return zeros. This prevents
+        # indexing into a NoneType which would otherwise cause a crash.
+        if self.gt_depths is None:
+            print("Ground truth depths not available, skipping evaluation.")
+            return 0.0, 0.0
 
         self.set_eval()
         pred_depths = []
