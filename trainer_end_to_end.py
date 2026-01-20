@@ -1162,20 +1162,20 @@ class Trainer:
 
             # images every log_frequency steps
             if self.step % self.opt.log_frequency == 0:
-                j = 0  # first element of the batch
-
-                # RGB
-                rgb = _to_rgb_image(inputs[("color", 0, 0)][j])
-                log_dict[f"{mode}/rgb"] = wandb.Image(rgb)
-
-                # depth (if available)
-                if ("depth", 0, 0) in outputs:
-                    depth = _to_depth_image(outputs[("depth", 0, 0)][j, 0])
-                    log_dict[f"{mode}/depth"] = wandb.Image(depth)
-
-                if ("disp", 0) in outputs:
-                    disp = _to_depth_image(outputs[("disp", 0)][j, 0])
-                    log_dict[f"{mode}/disp"] = wandb.Image(disp)
+                # Log all images in the batch. Use separate keys for each index.
+                batch_size = inputs[("color", 0, 0)].shape[0]
+                for j in range(batch_size):
+                    # RGB image
+                    rgb = _to_rgb_image(inputs[("color", 0, 0)][j])
+                    log_dict[f"{mode}/rgb_{j}"] = wandb.Image(rgb)
+                    # Predicted depth (if available)
+                    if ("depth", 0, 0) in outputs:
+                        depth = _to_depth_image(outputs[("depth", 0, 0)][j, 0])
+                        log_dict[f"{mode}/depth_{j}"] = wandb.Image(depth)
+                    # Disparity map (if available)
+                    if ("disp", 0) in outputs:
+                        disp = _to_depth_image(outputs[("disp", 0)][j, 0])
+                        log_dict[f"{mode}/disp_{j}"] = wandb.Image(disp)
 
             # intrinsics prediction K (if you are learning intrinsics)
             if getattr(self.opt, "learn_intrinsics", False) and ("K", 0) in outputs:
