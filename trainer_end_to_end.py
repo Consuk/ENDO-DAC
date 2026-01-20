@@ -565,7 +565,11 @@ class Trainer:
         errors = []
         ratios = []
 
-        for i in range(pred_depths.shape[0]):
+        # only evaluate up to the available number of ground-truth depth maps
+        n = min(pred_depths.shape[0], len(self.gt_depths))
+        if pred_depths.shape[0] != n:
+            print(f"Warning: {pred_depths.shape[0]} predictions but only {len(self.gt_depths)} ground-truth depths; evaluating first {n}")
+        for i in range(n):
             gt_depth = self.gt_depths[i]
             gt_height, gt_width = gt_depth.shape[:2]
 
