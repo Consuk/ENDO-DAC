@@ -14,8 +14,9 @@ import matplotlib.cm as cm
 import wandb
 
 import datasets
-# Import our custom HamlynDataset for monocular Hamlyn training
-from datasets.hamlyn_dataset import HamlynDataset
+# Explicitly import Hamlyn and C3VD dataset classes so they can be used below
+from datasets.hamlyn_dataset import HamlynDataset  # type: ignore
+from datasets.c3vd_dataset import C3VDDataset  # type: ignore
 import models.encoders as encoders
 import models.decoders as decoders
 import models.endodac as endodac
@@ -218,39 +219,32 @@ class Trainer:
         print("Training is using:\n  ", self.device)
 
         # ------------------ Data ------------------
-        # Select the dataset implementation and load filename lists based on the split.
-        # For the Hamlyn dataset we use our custom HamlynDataset and read the
-        # train/test splits directly from the data_path directory. Otherwise we
-        # fall back to the standard behaviour using the "splits" folder.
-        datasets_dict = {"endovis": datasets.SCAREDRAWDataset}
-        if self.opt.split == "hamlyn":
-            # Use the custom dataset for Hamlyn monocular training
-            self.dataset = HamlynDataset
-            # Define where to find the split lists relative to the data path
-            train_file_path = os.path.join(self.opt.data_path, "train_files.txt")
-            test_file_path = os.path.join(self.opt.data_path, "test_files.txt")
-            if not os.path.exists(train_file_path):
-                raise FileNotFoundError(f"Expected train_files.txt at {train_file_path}")
-            if not os.path.exists(test_file_path):
-                raise FileNotFoundError(f"Expected test_files.txt at {test_file_path}")
-            train_filenames = readlines(train_file_path)
-            # Use the test list for validation if no separate val list is provided
-            val_filenames = readlines(test_file_path)
-            test_filenames = readlines(test_file_path)
-            img_ext = ".jpg"
-            # Ensure intrinsics are learned rather than provided by the dataset
-            if not getattr(self.opt, "learn_intrinsics", False):
-                self.opt.learn_intrinsics = True
+        # Choose the correct dataset class based on the dataset argument
+        datasets_dict = {
+            "endovis": datasets.SCAREDRAWDataset,
+            "hamlyn": HamlynDataset,
+            "c3vd": C3VDDataset,
+        }
+        # Default to SCAREDRAWDataset if an unknown dataset is specified
+        self.dataset = datasets_dict.get(self.opt.dataset, datasets.SCAREDRAWDataset)
+
+        fpath = os.path.join(
+            os.path.dirname(__file__), "splits", self.opt.split, "{}_files.txt"
+        )
+        train_filenames = readlines(fpath.format("train"))
+        # Use validation list if it exists; otherwise reuse test list for validation
+        val_file = fpath.format("val")
+        if os.path.exists(val_file):
+            val_filenames = readlines(val_file)
         else:
-            # Use the default dataset implementation
-            self.dataset = datasets_dict[self.opt.dataset]
-            fpath = os.path.join(
-                os.path.dirname(__file__), "splits", self.opt.split, "{}_files.txt"
-            )
-            train_filenames = readlines(fpath.format("train"))
-            val_filenames = readlines(fpath.format("val"))
-            test_filenames = readlines(fpath.format("test"))
-            img_ext = ".jpg" if self.opt.split == "hamlyn" else ".png"
+            val_filenames = readlines(fpath.format("test"))
+        test_filenames = readlines(fpath.format("test"))
+
+        # Image extension depending on split
+        if self.opt.split == "hamlyn":
+            img_ext = ".jpg"
+        else:
+            img_ext = ".png"
 
         num_train_samples = len(train_filenames)
         self.num_total_steps = (
@@ -1165,10 +1159,6 @@ class Trainer:
         if getattr(self.opt, "use_wandb", False):
             # scalars
             log_dict = {f"{mode}/{l}": float(v) for l, v in losses.items()}
-            # Log the total loss separately under a descriptive name. Many users
-            # find it clearer to track the overall loss curve explicitly.
-            if "loss" in losses:
-                log_dict[f"{mode}/total_loss"] = float(losses["loss"])
 
             # images every log_frequency steps
             if self.step % self.opt.log_frequency == 0:

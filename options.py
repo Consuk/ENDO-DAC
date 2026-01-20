@@ -102,12 +102,13 @@ class MonodepthOptions:
             default=18,
             choices=[18, 34, 50, 101, 152],
         )
+        # Allow selection of different datasets: endovis, hamlyn or c3vd
         self.parser.add_argument(
             "--dataset",
             type=str,
             help="dataset to train on",
             default="endovis",
-            choices=["endovis"],
+            choices=["endovis", "hamlyn", "c3vd"],
         )
         self.parser.add_argument(
             "--png",
