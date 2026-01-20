@@ -15,7 +15,7 @@ import wandb
 
 import datasets
 # Import our custom HamlynDataset for monocular Hamlyn training
-from hamlyn_dataset import HamlynDataset
+from datasets.hamlyn_dataset import HamlynDataset
 import models.encoders as encoders
 import models.decoders as decoders
 import models.endodac as endodac
