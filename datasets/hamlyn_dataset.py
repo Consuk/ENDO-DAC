@@ -227,7 +227,10 @@ class HamlynDataset(data.Dataset):
             # Pre-sort indices for quick nearest neighbour lookup
             self.sorted_indices[folder] = sorted(index_dict.keys())
 
-        # Depth is always available for Hamlyn sequences
+        # Depth is always available for Hamlyn sequences.  However, we only load
+        # depth maps during evaluation (not during training) to avoid
+        # collate errors when images have different native resolutions.
+        # self.load_depth indicates whether depth files exist for this dataset.
         self.load_depth = True
 
     def __len__(self) -> int:
@@ -435,8 +438,10 @@ class HamlynDataset(data.Dataset):
             inputs.pop(("color", i, -1))
             inputs.pop(("color_aug", i, -1))
 
-        # Load ground truth depth map
-        if self.load_depth:
+        # Load ground truth depth map only during evaluation (not training).
+        # If loaded during training, depth maps of varying native resolution
+        # would be stacked by the DataLoader causing a runtime resize error.
+        if self.load_depth and not self.is_train:
             depth = self.get_depth(folder, frame_index, side, do_flip)
             # Expand dims to [1, H, W] for consistency
             inputs["depth_gt"] = torch.from_numpy(
