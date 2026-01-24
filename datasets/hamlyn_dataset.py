@@ -227,11 +227,13 @@ class HamlynDataset(data.Dataset):
             # Pre-sort indices for quick nearest neighbour lookup
             self.sorted_indices[folder] = sorted(index_dict.keys())
 
-        # Depth is always available for Hamlyn sequences.  However, we only load
-        # depth maps during evaluation (not during training) to avoid
-        # collate errors when images have different native resolutions.
-        # self.load_depth indicates whether depth files exist for this dataset.
-        self.load_depth = True
+        # Depth maps exist in Hamlyn sequences, but we avoid loading them in
+        # this dataset to prevent variable-size tensors from breaking the
+        # DataLoader.  Ground truth depths should instead be provided via
+        # precomputed .npz files during evaluation.  If you need access to
+        # depth maps at runtime, set load_depth to True and implement a
+        # custom collate_fn to handle variable shapes.
+        self.load_depth = False
 
     def __len__(self) -> int:
         return len(self.filenames)
