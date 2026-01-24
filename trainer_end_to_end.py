@@ -312,6 +312,7 @@ class Trainer:
             self.writers[mode] = SummaryWriter(os.path.join(self.log_path, mode))
 
         # ---------------- W&B init ----------------
+        # Initialize Weights & Biases only when --use_wandb is provided.
         self.use_wandb = getattr(self.opt, "use_wandb", False)
         if self.use_wandb:
             run_name = getattr(self.opt, "wandb_run_name", None) or self.opt.model_name
@@ -319,6 +320,17 @@ class Trainer:
                 project=getattr(self.opt, "wandb_project", "endodac"),
                 name=run_name,
                 config=self.opt.__dict__,
+            )
+            # Log additional configuration details about the training run
+            # such as frame ids and whether stereo pairs are used.
+            wandb.config.update(
+                {
+                    "frame_ids": self.opt.frame_ids,
+                    "use_stereo": self.opt.use_stereo,
+                    "dataset": self.opt.dataset,
+                    "split": self.opt.split,
+                },
+                allow_val_change=True,
             )
         # ------------------------------------------
 
@@ -1189,6 +1201,16 @@ class Trainer:
                 log_dict[f"{mode}/K_cx"] = float(K[0, 2])
                 log_dict[f"{mode}/K_cy"] = float(K[1, 2])
 
+            # Include additional metrics for easier monitoring
+            # Log the total loss explicitly to highlight convergence
+            if "loss" in losses:
+                log_dict[f"{mode}/loss_total"] = float(losses["loss"])
+            # Log whether the model is using neighbor frames (more than just the reference frame)
+            log_dict[f"{mode}/uses_neighbors"] = bool(len(self.opt.frame_ids) > 1)
+            log_dict[f"{mode}/frame_ids"] = str(self.opt.frame_ids)
+            log_dict[f"{mode}/use_stereo"] = bool(self.opt.use_stereo)
+
+            # Finally log everything to W&B
             wandb.log(log_dict, step=self.step)
         # ------------------------------------------------------
 
