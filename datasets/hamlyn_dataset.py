@@ -172,7 +172,18 @@ class HamlynDataset(data.Dataset):
         # available index is used. The mapping only considers files in
         # ``image01`` because all other modalities share the same base
         # filename with a different extension or parent directory.
+        #
+        # In the Hamlyn dataset, some splits provide folder names
+        # without the inner repetition (e.g. "rectified01" instead of
+        # "rectified01/rectified01"). To support both conventions, we
+        # resolve each folder name to an actual directory that contains
+        # the ``image01`` subdirectory and record that mapping. If
+        # neither convention yields a valid directory, the folder will
+        # map to itself and missing frames will raise a FileNotFoundError
+        # during loading.
         self.index_map = {}
+        self.sorted_indices = {}
+        self.actual_folder_map = {}
         unique_folders = set()
         for line in self.filenames:
             parts = line.strip().split()
@@ -181,24 +192,40 @@ class HamlynDataset(data.Dataset):
             folder = parts[0]
             unique_folders.add(folder)
         for folder in unique_folders:
-            folder_path = os.path.join(self.data_path, folder, "image01")
+            # Determine the actual folder path that contains the data.
+            # Start by assuming the folder provided is correct.
+            candidate_paths = []
+            # Candidate 1: data_path/folder
+            candidate_paths.append(folder)
+            # Candidate 2: data_path/folder/folder (handles splits that omit the repeated folder)
+            candidate_paths.append(os.path.join(folder, folder))
+            actual_folder = None
             index_dict = {}
-            if os.path.isdir(folder_path):
-                for fname in os.listdir(folder_path):
-                    if fname.lower().endswith(self.img_ext.lower()):
-                        name_no_ext = os.path.splitext(fname)[0]
-                        try:
-                            idx = int(name_no_ext)
-                        except ValueError:
-                            # Skip non-numeric filenames
-                            continue
-                        index_dict[idx] = fname
+            for cand in candidate_paths:
+                # Check if image01 exists under this candidate
+                folder_path = os.path.join(self.data_path, cand, "image01")
+                if os.path.isdir(folder_path):
+                    actual_folder = cand
+                    # Build mapping for this folder
+                    for fname in os.listdir(folder_path):
+                        # only consider files matching the configured image extension
+                        if fname.lower().endswith(self.img_ext.lower()):
+                            name_no_ext = os.path.splitext(fname)[0]
+                            try:
+                                idx = int(name_no_ext)
+                            except ValueError:
+                                # Skip non-numeric filenames
+                                continue
+                            index_dict[idx] = fname
+                    break
+            # Record the actual folder (fall back to the original folder if no valid path found)
+            if actual_folder is None:
+                # no mapping; we still record an empty index_dict and actual folder same as provided
+                actual_folder = folder
+            self.actual_folder_map[folder] = actual_folder
             self.index_map[folder] = index_dict
-
-        # Pre-sort the indices for quick nearest neighbour lookup
-        self.sorted_indices = {
-            folder: sorted(mapping.keys()) for folder, mapping in self.index_map.items()
-        }
+            # Pre-sort indices for quick nearest neighbour lookup
+            self.sorted_indices[folder] = sorted(index_dict.keys())
 
         # Depth is always available for Hamlyn sequences
         self.load_depth = True
@@ -283,9 +310,13 @@ class HamlynDataset(data.Dataset):
         idx = self.get_nearest_index(folder, frame_index)
         fname = self.index_map.get(folder, {}).get(idx)
         if fname is None:
-            # Fallback to zero-padded naming convention
-            fname = f"{frame_index:06d}{self.img_ext}"
-        img_path = os.path.join(self.data_path, folder, side_dir, fname)
+            # Fallback to zero-padded naming convention. Hamlyn filenames are
+            # typically 10-digit zero padded (e.g. 0000000980.jpg). Use 10 digits
+            # here to avoid mismatches when the index_map is empty.
+            fname = f"{frame_index:010d}{self.img_ext}"
+        # Use the resolved actual folder to construct the image path
+        actual_folder = self.actual_folder_map.get(folder, folder)
+        img_path = os.path.join(self.data_path, actual_folder, side_dir, fname)
         color = self.loader(img_path)
         if do_flip:
             color = color.transpose(Image.FLIP_LEFT_RIGHT)
@@ -307,11 +338,13 @@ class HamlynDataset(data.Dataset):
         idx = self.get_nearest_index(folder, frame_index)
         fname = self.index_map.get(folder, {}).get(idx)
         if fname is None:
-            fname = f"{frame_index:06d}{self.img_ext}"
+            fname = f"{frame_index:010d}{self.img_ext}"
         # Replace the image extension with .png for depth maps
         base = os.path.splitext(fname)[0]
         depth_fname = base + ".png"
-        depth_path = os.path.join(self.data_path, folder, depth_dir, depth_fname)
+        # Use the resolved actual folder to construct the depth path
+        actual_folder = self.actual_folder_map.get(folder, folder)
+        depth_path = os.path.join(self.data_path, actual_folder, depth_dir, depth_fname)
         depth = np.array(Image.open(depth_path))
         if do_flip:
             depth = np.fliplr(depth)
