@@ -1,301 +1,462 @@
+"""
+Hamlyn Dataset loader with support for predefined train/test file lists
+and monocular training.
+
+This dataset follows a similar interface to the MonoDataset provided in
+the original codebase. It accepts a list of lines describing which
+frames to load for training or evaluation. Each line should be formatted
+as:
+
+    <folder> <frame_index> <side>
+
+Where:
+    * ``folder`` is the name of the sequence folder, e.g. ``rectified01``.
+    * ``frame_index`` is the index of the frame to load as an integer.
+    * ``side`` is either ``l`` or ``r`` indicating the left or right view.
+
+The dataset will automatically locate the corresponding image and depth
+files inside the ``image01``/``image02`` and ``depth01``/``depth02``
+subfolders of each sequence folder. It will also provide dummy camera
+intrinsics for each pyramid scale so that the training code can run
+without learning intrinsics from the dataset itself. Intrinsics are
+normalised such that at full resolution fx = 0.5 * width and fy =
+0.5 * height with principal point at the centre of the image. These
+values are unlikely to perfectly match the real camera but are sufficient
+for training when the network learns intrinsics via its own decoder.
+
+Note: This implementation intentionally omits any cropping or filtering
+logic present in the previous Hamlyn dataset. The goal is to provide
+a minimal, deterministic loader which should not modify the data beyond
+optional random horizontal flipping and colour jittering.
+"""
+
+from __future__ import absolute_import, division, print_function
+
 import os
-import cv2
-import time
+import random
 import numpy as np
-from tqdm import tqdm
+from PIL import Image
+from PIL import ImageFile
 
 import torch
-from torch.utils.data import DataLoader
-import scipy.stats as st
+import torch.utils.data as data
+from torchvision import transforms
 
-from utils.layers import disp_to_depth
-from utils.utils import readlines, compute_errors
-from options import MonodepthOptions
-
-import datasets
-cv2.setNumThreads(0)
-splits_dir = os.path.join(os.path.dirname(__file__), "splits")
+# Prevent PIL from failing on truncated images
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
-def load_gt_depths_npz(eval_split: str):
-    gt_path = os.path.join(splits_dir, eval_split, "gt_depths.npz")
-    if not os.path.exists(gt_path):
-        raise FileNotFoundError(
-            f"Missing GT file: {gt_path}\n"
-            f"Generate it with export_gt_depth.py for split='{eval_split}'."
-        )
-    data_npz = np.load(gt_path, fix_imports=True, encoding="latin1", allow_pickle=True)
-    gt_depths = data_npz["data"]
-    # Some npz files are saved as object arrays; convert to list for safety
-    if isinstance(gt_depths, np.ndarray) and gt_depths.dtype == object:
-        gt_depths = list(gt_depths)
-    return gt_depths
+def pil_loader(path: str) -> Image.Image:
+    """Load an image file as an RGB PIL Image.
 
+    Args:
+        path: Absolute path to the image file.
 
-def build_dataset_and_loader(opt):
+    Returns:
+        A PIL Image in RGB mode.
     """
-    Trainer-style dataset wiring:
-      - dataset selection by opt.dataset (fallback to opt.eval_split)
-      - filenames from splits/<eval_split>/test_files.txt
-      - img_ext: .jpg for hamlyn, else .png (matches trainer behavior)
-      - frame_ids used for evaluation: [0]
+    with open(path, "rb") as f:
+        with Image.open(f) as img:
+            return img.convert("RGB")
+
+
+class HamlynDataset(data.Dataset):
+    """Dataset for the Hamlyn endoscopic dataset using explicit file lists.
+
+    This class is designed to be drop-in compatible with the existing
+    training pipeline. It behaves similarly to the ``MonoDataset`` but
+    instead of inferring file names from a generic naming scheme, it
+    constructs a mapping from the provided list of examples to the
+    corresponding image and depth files on disk. If a requested frame
+    index is missing from the sequence, the nearest available frame is
+    used instead. Stereo pairs are supported via the 's' entry in
+    ``frame_idxs``; however, by default this dataset is intended for
+    monocular training with ``frame_idxs`` such as [0, -1, 1].
+
+    Parameters
+    ----------
+    data_path : str
+        Root directory where all sequence folders reside. Each folder
+        should contain ``image01``, ``image02``, ``depth01`` and
+        ``depth02`` subfolders.
+    filenames : list[str]
+        List of strings describing which frames to load. Each entry
+        should be whitespace separated as ``<folder> <frame_index> <side>``.
+    height : int
+        Output image height after resizing.
+    width : int
+        Output image width after resizing.
+    frame_idxs : list
+        Frame indices relative to the current frame to load. For
+        example [0, -1, 1] loads the current, previous and next frames.
+        Use 's' to indicate the opposite stereo camera.
+    num_scales : int
+        Number of image pyramid scales used in training.
+    is_train : bool, optional
+        If True, enables random colour jitter and horizontal flips.
+    img_ext : str, optional
+        File extension for image files (e.g. '.jpg' or '.png'). This is
+        used when constructing a fallback filename if a frame index is
+        missing from the mapping. Defaults to '.jpg'.
     """
-    # Choose dataset key similar to trainer:
-    # trainer uses opt.dataset for selecting class, opt.split for filelists
-    dataset_key = getattr(opt, "dataset", None) or opt.eval_split
 
-    datasets_dict = {
-        "endovis": datasets.SCAREDRAWDataset,  # trainer maps "endovis" -> SCAREDRAWDataset
-        "hamlyn": HamlynDataset,               # trainer maps "hamlyn" -> HamlynDataset
-    }
-    if C3VDDataset is not None:
-        datasets_dict["c3vd"] = C3VDDataset
+    def __init__(self,
+                 data_path: str,
+                 filenames: list,
+                 height: int,
+                 width: int,
+                 frame_idxs: list,
+                 num_scales: int,
+                 is_train: bool = False,
+                 img_ext: str = ".jpg"):
+        super(HamlynDataset, self).__init__()
 
-    dataset_cls = datasets_dict.get(dataset_key, datasets.SCAREDRAWDataset)
+        self.data_path = data_path
+        self.filenames = filenames
+        self.height = height
+        self.width = width
+        self.frame_idxs = frame_idxs
+        self.num_scales = num_scales
+        self.is_train = is_train
+        self.img_ext = img_ext
 
-    # Load test filenames exactly like trainer does (but for eval_split)
-    fpath = os.path.join(splits_dir, opt.eval_split, "test_files.txt")
-    if not os.path.exists(fpath):
-        raise FileNotFoundError(f"Missing split file: {fpath}")
+        self.loader = pil_loader
+        self.to_tensor = transforms.ToTensor()
 
-    filenames = readlines(fpath)
+        # Colour jitter parameters. To match the behaviour of the original
+        # datasets, we attempt to use tuple ranges first. If this fails
+        # (older torchvision versions), fall back to scalar ranges.
+        try:
+            self.brightness = (0.8, 1.2)
+            self.contrast = (0.8, 1.2)
+            self.saturation = (0.8, 1.2)
+            self.hue = (-0.1, 0.1)
+            # sanity check instantiation of ColourJitter
+            transforms.transforms.ColorJitter(
+                self.brightness, self.contrast, self.saturation, self.hue
+            )
+        except TypeError:
+            self.brightness = 0.2
+            self.contrast = 0.2
+            self.saturation = 0.2
+            self.hue = 0.1
 
-    # img_ext matches trainer's hamlyn override
-    img_ext = ".jpg" if opt.eval_split == "hamlyn" else ".png"
+        # Define resize transforms for each pyramid scale
+        self.interp = Image.LANCZOS
+        self.resize = {}
+        for i in range(self.num_scales):
+            s = 2 ** i
+            self.resize[i] = transforms.Resize(
+                (self.height // s, self.width // s), interpolation=self.interp
+            )
 
-    # For evaluation we only need frame 0 (single image per sample)
-    frame_ids = [0]
-    num_scales = 4
-
-    dataset = dataset_cls(
-        opt.data_path,
-        filenames,
-        opt.height,
-        opt.width,
-        frame_ids,
-        num_scales,
-        is_train=False,
-        img_ext=img_ext,
-    )
-
-    # Use a batch size if available; default to 16 for speed
-    batch_size = getattr(opt, "eval_batch_size", 16)
-
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=opt.num_workers,
-        pin_memory=True,
-        drop_last=False,
-    )
-
-    return dataset, loader, filenames
-
-
-def load_model(opt):
-    """
-    Same model-loading behavior as your existing evaluate_depth.py:
-      - If model_type == endodac: load depth_model.pth
-      - If model_type == afsfm: load encoder.pth + depth.pth
-    """
-    opt.load_weights_folder = os.path.expanduser(opt.load_weights_folder)
-    if not os.path.isdir(opt.load_weights_folder):
-        raise FileNotFoundError(f"Cannot find folder: {opt.load_weights_folder}")
-
-    print(f"-> Loading weights from {opt.load_weights_folder}")
-
-    if opt.model_type == "endodac":
-        depther_path = os.path.join(opt.load_weights_folder, "depth_model.pth")
-        depther_dict = torch.load(depther_path, map_location="cpu")
-
-        depther = endodac.endodac(
-            backbone_size="base",
-            r=opt.lora_rank,
-            lora_type=opt.lora_type,
-            image_shape=(224, 280),
-            pretrained_path=opt.pretrained_path,
-            residual_block_indexes=opt.residual_block_indexes,
-            include_cls_token=opt.include_cls_token,
-        )
-        model_dict = depther.state_dict()
-        depther.load_state_dict(
-            {k: v for k, v in depther_dict.items() if k in model_dict},
-            strict=False,
-        )
-        depther.cuda().eval()
-        return depther
-
-    if opt.model_type == "afsfm":
-        encoder_path = os.path.join(opt.load_weights_folder, "encoder.pth")
-        decoder_path = os.path.join(opt.load_weights_folder, "depth.pth")
-        encoder_dict = torch.load(encoder_path, map_location="cpu")
-
-        encoder = encoders.ResnetEncoder(opt.num_layers, False)
-        depth_decoder = decoders.DepthDecoder(encoder.num_ch_enc, scales=range(4))
-
-        model_dict = encoder.state_dict()
-        encoder.load_state_dict(
-            {k: v for k, v in encoder_dict.items() if k in model_dict},
-            strict=False,
-        )
-        depth_decoder.load_state_dict(torch.load(decoder_path, map_location="cpu"))
-
-        encoder.cuda().eval()
-        depth_decoder.cuda().eval()
-
-        def depther(image):
-            return depth_decoder(encoder(image))
-
-        return depther
-
-    raise ValueError("You must set --model_type endodac or --model_type afsfm")
-
-
-def evaluate(opt):
-    MIN_DEPTH = 1e-3
-    MAX_DEPTH = 150
-
-    assert sum((opt.eval_mono, opt.eval_stereo)) == 1, \
-        "Choose mono or stereo with --eval_mono or --eval_stereo"
-
-    # ----------------------------
-    # Load predictions or model
-    # ----------------------------
-    if opt.ext_disp_to_eval is None:
-        depther = load_model(opt)
-        pred_disps = None
-    else:
-        print(f"-> Loading predictions from {opt.ext_disp_to_eval}")
-        pred_disps = np.load(opt.ext_disp_to_eval)
-        depther = None
-
-    # ----------------------------
-    # Trainer-style dataset creation
-    # ----------------------------
-    dataset, dataloader, filenames = build_dataset_and_loader(opt)
-
-    # Load GT depths for eval_split
-    gt_depths = load_gt_depths_npz(opt.eval_split)
-
-    # ----------------------------
-    # Predict
-    # ----------------------------
-    inference_times = []
-    if pred_disps is None:
-        print(f"-> Computing predictions with size {opt.width}x{opt.height}")
-        pred_disps_list = []
-
-        with torch.no_grad():
-            for _, data in tqdm(enumerate(dataloader), total=len(dataloader)):
-                input_color = data[("color", 0, 0)].cuda()
-
-                if opt.post_process:
-                    input_color = torch.cat((input_color, torch.flip(input_color, [3])), 0)
-
-                t0 = time.time()
-                output = depther(input_color)
-                inference_times.append(time.time() - t0)
-
-                if not isinstance(output, dict) or ("disp", 0) not in output:
-                    raise RuntimeError("Model output does not contain ('disp', 0).")
-
-                pred_disp, _ = disp_to_depth(output[("disp", 0)], opt.min_depth, opt.max_depth)
-                pred_disp = pred_disp.cpu()[:, 0].numpy()  # (B,H,W)
-
-                # Keep behavior consistent with your current eval script: no batch post-process merge
-                pred_disps_list.append(pred_disp)
-
-        pred_disps = np.concatenate(pred_disps_list, axis=0)
-
-    # ----------------------------
-    # Sanity check ordering
-    # ----------------------------
-    print(f"-> num_pred: {pred_disps.shape[0]} | num_gt: {len(gt_depths)} | num_split_lines: {len(filenames)}")
-    if pred_disps.shape[0] != len(gt_depths):
-        raise AssertionError(
-            f"Mismatch: {pred_disps.shape[0]} predictions vs {len(gt_depths)} gt depth maps.\n"
-            f"Check that gt_depths.npz was generated from the SAME test_files.txt used here:\n"
-            f"  splits/{opt.eval_split}/test_files.txt"
+        # Normalised camera intrinsics. These will be scaled by the
+        # requested output width and height in __getitem__. The choice of
+        # 0.5 for focal lengths and principal point centres places the
+        # optical centre in the middle of the image with a field of view
+        # of approximately 90 degrees. These values are not dataset
+        # specific but serve as a reasonable default when intrinsics are
+        # learned during training.
+        self.K = np.array(
+            [
+                [0.5, 0.0, 0.5],
+                [0.0, 0.5, 0.5],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float32,
         )
 
-    # ----------------------------
-    # Scaling mode
-    # ----------------------------
-    if opt.eval_stereo:
-        print("   Stereo evaluation - disabling median scaling")
-        opt.disable_median_scaling = True
-    else:
-        print("   Mono evaluation - using median scaling")
+        # Build an index mapping for each sequence folder. This allows
+        # efficient lookup of filenames given a numeric frame index. If a
+        # frame index is not present in the mapping, the nearest
+        # available index is used. The mapping only considers files in
+        # ``image01`` because all other modalities share the same base
+        # filename with a different extension or parent directory.
+        #
+        # In the Hamlyn dataset, some splits provide folder names
+        # without the inner repetition (e.g. "rectified01" instead of
+        # "rectified01/rectified01"). To support both conventions, we
+        # resolve each folder name to an actual directory that contains
+        # the ``image01`` subdirectory and record that mapping. If
+        # neither convention yields a valid directory, the folder will
+        # map to itself and missing frames will raise a FileNotFoundError
+        # during loading.
+        self.index_map = {}
+        self.sorted_indices = {}
+        self.actual_folder_map = {}
+        unique_folders = set()
+        for line in self.filenames:
+            parts = line.strip().split()
+            if not parts:
+                continue
+            folder = parts[0]
+            unique_folders.add(folder)
+        for folder in unique_folders:
+            # Determine the actual folder path that contains the data.
+            # Start by assuming the folder provided is correct.
+            candidate_paths = []
+            # Candidate 1: data_path/folder
+            candidate_paths.append(folder)
+            # Candidate 2: data_path/folder/folder (handles splits that omit the repeated folder)
+            candidate_paths.append(os.path.join(folder, folder))
+            actual_folder = None
+            index_dict = {}
+            for cand in candidate_paths:
+                # Check if image01 exists under this candidate
+                folder_path = os.path.join(self.data_path, cand, "image01")
+                if os.path.isdir(folder_path):
+                    actual_folder = cand
+                    # Build mapping for this folder
+                    for fname in os.listdir(folder_path):
+                        # only consider files matching the configured image extension
+                        if fname.lower().endswith(self.img_ext.lower()):
+                            name_no_ext = os.path.splitext(fname)[0]
+                            try:
+                                idx = int(name_no_ext)
+                            except ValueError:
+                                # Skip non-numeric filenames
+                                continue
+                            index_dict[idx] = fname
+                    break
+            # Record the actual folder (fall back to the original folder if no valid path found)
+            if actual_folder is None:
+                # no mapping; we still record an empty index_dict and actual folder same as provided
+                actual_folder = folder
+            self.actual_folder_map[folder] = actual_folder
+            self.index_map[folder] = index_dict
+            # Pre-sort indices for quick nearest neighbour lookup
+            self.sorted_indices[folder] = sorted(index_dict.keys())
 
-    # ----------------------------
-    # Evaluate metrics
-    # ----------------------------
-    errors = []
-    ratios = []
+        # Depth maps exist in Hamlyn sequences, but we avoid loading them in
+        # this dataset to prevent variable-size tensors from breaking the
+        # DataLoader.  Ground truth depths should instead be provided via
+        # precomputed .npz files during evaluation.  If you need access to
+        # depth maps at runtime, set load_depth to True and implement a
+        # custom collate_fn to handle variable shapes.
+        self.load_depth = False
 
-    for i in range(pred_disps.shape[0]):
-        gt_depth = gt_depths[i]
-        gt_h, gt_w = gt_depth.shape[:2]
+    def __len__(self) -> int:
+        return len(self.filenames)
 
-        pred_disp = pred_disps[i]
-        pred_disp = cv2.resize(pred_disp, (gt_w, gt_h))
-        pred_depth = 1.0 / pred_disp
+    def preprocess(self, inputs: dict, color_aug) -> None:
+        """Resize and augment colour images for each scale.
 
-        mask = np.logical_and(gt_depth > MIN_DEPTH, gt_depth < MAX_DEPTH)
+        This function operates in-place on the ``inputs`` dictionary. It
+        creates pyramid scaled versions of each colour image and their
+        augmented counterparts. The augmented images use the same random
+        transform for all images in the sample to maintain consistency
+        between frames.
 
-        pred_depth = pred_depth[mask]
-        gt_valid = gt_depth[mask]
+        Args:
+            inputs: Dictionary containing raw PIL Images under keys
+                of the form ``("color", frame_id, -1)``. These will be
+                replaced by resized tensors at all scales.
+            color_aug: A callable that applies colour jitter to an image.
+        """
+        # First resize raw images to each scale
+        for k in list(inputs.keys()):
+            if "color" in k:
+                _, frame_id, scale_id = k
+                if scale_id == -1:
+                    for i in range(self.num_scales):
+                        inputs[(k[0], frame_id, i)] = self.resize[i](inputs[k])
 
-        # If you want to apply scale factor like some KITTI pipelines:
-        # pred_depth *= opt.pred_depth_scale_factor
+        # Then convert to tensors and apply colour augmentation
+        for k in list(inputs.keys()):
+            f = inputs[k]
+            if "color" in k:
+                _, frame_id, scale_id = k
+                inputs[(k[0], frame_id, scale_id)] = self.to_tensor(f)
+                inputs[(k[0] + "_aug", frame_id, scale_id)] = self.to_tensor(
+                    color_aug(f)
+                )
 
-        if not opt.disable_median_scaling:
-            ratio = np.median(gt_valid) / np.median(pred_depth)
-            ratios.append(ratio)
-            pred_depth *= ratio
+    def get_nearest_index(self, folder: str, target_idx: int) -> int:
+        """Return the nearest available frame index for a given folder.
 
-        pred_depth[pred_depth < MIN_DEPTH] = MIN_DEPTH
-        pred_depth[pred_depth > MAX_DEPTH] = MAX_DEPTH
+        If the exact ``target_idx`` exists, it is returned. Otherwise the
+        closest existing index is chosen.
 
-        err = compute_errors(gt_valid, pred_depth)
-        errors.append(err)
+        Args:
+            folder: Name of the sequence folder.
+            target_idx: Desired numeric frame index.
 
-    if not opt.disable_median_scaling:
-        ratios = np.array(ratios)
-        med = np.median(ratios)
-        print(" Scaling ratios | med: {:0.3f} | std: {:0.3f}".format(med, np.std(ratios / med)))
+        Returns:
+            The nearest available frame index.
+        """
+        mapping = self.index_map.get(folder, {})
+        if not mapping:
+            return target_idx
+        if target_idx in mapping:
+            return target_idx
+        # Choose the index with minimal absolute difference
+        candidates = self.sorted_indices.get(folder, [])
+        if not candidates:
+            return target_idx
+        return min(candidates, key=lambda k: abs(k - target_idx))
 
-    errors = np.array(errors)
-    mean_errors = np.mean(errors, axis=0)
+    def get_color(self, folder: str, frame_index: int, side: str, do_flip: bool) -> Image.Image:
+        """Load a colour image from disk.
 
-    # Confidence intervals (keep your existing feature)
-    cls = []
-    for k in range(len(mean_errors)):
-        cl = st.t.interval(
-            alpha=0.95,
-            df=len(errors) - 1,
-            loc=mean_errors[k],
-            scale=st.sem(errors[:, k]),
-        )
-        cls.append(cl[0])
-        cls.append(cl[1])
-    cls = np.array(cls)
+        Args:
+            folder: Sequence folder name.
+            frame_index: Numeric index of the frame to load. If the
+                exact index is not present in the sequence, the nearest
+                available index is used.
+            side: Either 'l' or 'r' indicating which stereo side to load.
+            do_flip: If True, perform a horizontal flip of the image.
 
-    print("\n       " + ("{:>11}      | " * 7).format("abs_rel", "sq_rel", "rmse", "rmse_log", "a1", "a2", "a3"))
-    print("mean:" + ("&{: 12.3f}      " * 7).format(*mean_errors.tolist()) + "\\\\")
-    print("cls: " + ("& [{: 6.3f}, {: 6.3f}] " * 7).format(*cls.tolist()) + "\\\\")
-    if len(inference_times) > 0:
-        print("average inference time: {:0.1f} ms".format(np.mean(np.array(inference_times)) * 1000))
-    print("\n-> Done!")
+        Returns:
+            A PIL Image in RGB mode.
+        """
+        # Determine which directory to load from based on the side
+        side_dir = "image01" if side == "l" else "image02"
+        # Resolve the nearest available index if needed
+        idx = self.get_nearest_index(folder, frame_index)
+        fname = self.index_map.get(folder, {}).get(idx)
+        if fname is None:
+            # Fallback to zero-padded naming convention. Hamlyn filenames are
+            # typically 10-digit zero padded (e.g. 0000000980.jpg). Use 10 digits
+            # here to avoid mismatches when the index_map is empty.
+            fname = f"{frame_index:010d}{self.img_ext}"
+        # Use the resolved actual folder to construct the image path
+        actual_folder = self.actual_folder_map.get(folder, folder)
+        img_path = os.path.join(self.data_path, actual_folder, side_dir, fname)
+        color = self.loader(img_path)
+        if do_flip:
+            color = color.transpose(Image.FLIP_LEFT_RIGHT)
+        return color
 
+    def get_depth(self, folder: str, frame_index: int, side: str, do_flip: bool) -> np.ndarray:
+        """Load a depth map from disk.
 
-if __name__ == "__main__":
-    options = MonodepthOptions()
-    opt = options.parse()
+        Args:
+            folder: Sequence folder name.
+            frame_index: Numeric index of the frame to load.
+            side: Either 'l' or 'r' indicating which stereo side to load.
+            do_flip: If True, perform a horizontal flip of the depth map.
 
-    # Default model_type if missing
-    if not hasattr(opt, "model_type") or opt.model_type is None:
-        opt.model_type = "endodac"
+        Returns:
+            A 2D numpy array containing the depth values.
+        """
+        depth_dir = "depth01" if side == "l" else "depth02"
+        idx = self.get_nearest_index(folder, frame_index)
+        fname = self.index_map.get(folder, {}).get(idx)
+        if fname is None:
+            fname = f"{frame_index:010d}{self.img_ext}"
+        # Replace the image extension with .png for depth maps
+        base = os.path.splitext(fname)[0]
+        depth_fname = base + ".png"
+        # Use the resolved actual folder to construct the depth path
+        actual_folder = self.actual_folder_map.get(folder, folder)
+        depth_path = os.path.join(self.data_path, actual_folder, depth_dir, depth_fname)
+        depth = np.array(Image.open(depth_path))
+        if do_flip:
+            depth = np.fliplr(depth)
+        return depth
 
-    evaluate(opt)
+    def check_depth(self) -> bool:
+        """Always return True for Hamlyn since depth maps are provided."""
+        return True
+
+    def __getitem__(self, index: int) -> dict:
+        """Construct a training sample from the provided file list.
+
+        This method follows the logic of the standard ``MonoDataset`` to
+        assemble a dictionary of images and associated metadata. It
+        handles temporal neighbours defined in ``self.frame_idxs`` and
+        stereo pairing if requested via the 's' token.
+
+        Args:
+            index: Index into the ``filenames`` list.
+
+        Returns:
+            A dictionary containing tensors for each image scale and
+            additional information such as camera intrinsics, depth
+            ground truth and stereo extrinsics if applicable.
+        """
+        inputs = {}
+
+        # Parse the file line describing the current sample
+        line = self.filenames[index].strip().split()
+        if len(line) == 0:
+            raise ValueError(f"Empty filename entry at index {index}")
+        folder = line[0]
+        frame_index = int(line[1]) if len(line) > 1 else 0
+        side = line[2] if len(line) > 2 else "l"
+
+        # Compute sequence id from the folder name (last two digits)
+        seq_digits = ''.join([c for c in folder if c.isdigit()])
+        if len(seq_digits) >= 2:
+            sequence = int(seq_digits[-2:])
+        elif len(seq_digits) == 1:
+            sequence = int(seq_digits)
+        else:
+            sequence = 0
+        inputs["sequence"] = torch.from_numpy(np.array(sequence, dtype=np.int64))
+        inputs["frame_id"] = torch.from_numpy(np.array(frame_index, dtype=np.int64))
+
+        # Determine whether to apply colour augmentation and horizontal flip
+        do_color_aug = self.is_train and random.random() > 0.5
+        do_flip = self.is_train and random.random() > 0.5
+
+        # Load the requested frames for each index in frame_idxs
+        for i in self.frame_idxs:
+            if i == "s":
+                # Opposite stereo side
+                other_side = "l" if side == "r" else "r"
+                img = self.get_color(folder, frame_index, other_side, do_flip)
+                inputs[("color", i, -1)] = img
+            else:
+                # Temporal neighbour or current frame
+                img = self.get_color(folder, frame_index + i, side, do_flip)
+                inputs[("color", i, -1)] = img
+
+        # Prepare dummy intrinsics for each scale. These are scaled
+        # versions of the normalised K defined in __init__.
+        for scale in range(self.num_scales):
+            K = self.K.copy()
+            # Scale focal lengths and principal point to the current
+            # resolution. Width and height reduction per scale follows
+            # powers of two.
+            K[0, :] *= self.width // (2 ** scale)
+            K[1, :] *= self.height // (2 ** scale)
+            inv_K = np.linalg.pinv(K)
+            inputs[("K", scale)] = torch.from_numpy(K)
+            inputs[("inv_K", scale)] = torch.from_numpy(inv_K)
+
+        # Apply the same colour augmentation to all images
+        if do_color_aug:
+            color_aug = transforms.ColorJitter(
+                self.brightness, self.contrast, self.saturation, self.hue
+            )
+        else:
+            color_aug = lambda x: x
+
+        # Resize and convert images to tensors; create augmented copies
+        self.preprocess(inputs, color_aug)
+        # Remove the raw image entries at scale -1
+        for i in self.frame_idxs:
+            inputs.pop(("color", i, -1))
+            inputs.pop(("color_aug", i, -1))
+
+        # Load ground truth depth map only during evaluation (not training).
+        # If loaded during training, depth maps of varying native resolution
+        # would be stacked by the DataLoader causing a runtime resize error.
+        if self.load_depth and not self.is_train:
+            depth = self.get_depth(folder, frame_index, side, do_flip)
+            # Expand dims to [1, H, W] for consistency
+            inputs["depth_gt"] = torch.from_numpy(
+                np.expand_dims(depth, 0).astype(np.float32)
+            )
+
+        # If stereo is requested, provide the baseline transform
+        if "s" in self.frame_idxs:
+            stereo_T = np.eye(4, dtype=np.float32)
+            baseline_sign = -1 if do_flip else 1
+            side_sign = -1 if side == "l" else 1
+            # A nominal baseline of 0.1 metres is assumed
+            stereo_T[0, 3] = side_sign * baseline_sign * 0.1
+            inputs["stereo_T"] = torch.from_numpy(stereo_T)
+
+        return inputs
