@@ -1,5 +1,3 @@
-from __future__ import absolute_import, division, print_function
-
 import os
 import cv2
 import time
@@ -8,7 +6,6 @@ from tqdm import tqdm
 
 import torch
 from torch.utils.data import DataLoader
-
 import scipy.stats as st
 
 from utils.layers import disp_to_depth
@@ -16,18 +13,7 @@ from utils.utils import readlines, compute_errors
 from options import MonodepthOptions
 
 import datasets
-from datasets.hamlyn_dataset import HamlynDataset  # trainer-style explicit import
-try:
-    from datasets.c3vd_dataset import C3VDDataset
-except Exception:
-    C3VDDataset = None
-
-from datasets.scared_dataset import SCAREDRAWDataset
-
-import models.encoders as encoders
-import models.decoders as decoders
-import models.endodac as endodac
-
+from datasets import HamlynDataset  # avoids circular import paths
 
 cv2.setNumThreads(0)
 splits_dir = os.path.join(os.path.dirname(__file__), "splits")
