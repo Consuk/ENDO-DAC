@@ -13,8 +13,6 @@ from utils.utils import readlines, compute_errors
 from options import MonodepthOptions
 
 import datasets
-from datasets import HamlynDataset  # avoids circular import paths
-
 cv2.setNumThreads(0)
 splits_dir = os.path.join(os.path.dirname(__file__), "splits")
 
