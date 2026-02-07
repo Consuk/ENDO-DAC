@@ -392,11 +392,16 @@ class HamlynDataset(data.Dataset):
                 # Horizontal flip about the image center
                 K[0, 2] = float(w_s - 1) - float(K[0, 2])
 
-            # Use pinv for numerical stability
-            inv_K = np.linalg.pinv(K)
+            # Endo-DAC Project3D expects 4x4 K and 4x4 inv_K (Monodepth-style).
+            # We therefore embed the 3x3 intrinsics into a 4x4 matrix.
+            K4 = np.eye(4, dtype=np.float32)
+            K4[:3, :3] = K.astype(np.float32)
 
-            Ks[scale] = K.astype(np.float32)
-            invKs[scale] = inv_K.astype(np.float32)
+            # Use pinv for numerical stability
+            inv_K4 = np.linalg.pinv(K4)
+
+            Ks[scale] = K4.astype(np.float32)
+            invKs[scale] = inv_K4.astype(np.float32)
 
         return Ks, invKs, used_file
 
