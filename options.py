@@ -81,6 +81,21 @@ class MonodepthOptions:
             default=True,
         )
 
+
+        # Hamlyn intrinsics (used when --dataset hamlyn and --learn_intrinsics is False)
+        self.parser.add_argument(
+            "--hamlyn_use_intrinsics_file",
+            type=str2bool,
+            help="(Hamlyn) Use per-sequence intrinsics from intrinsics.txt as fixed intrinsics (only used when learn_intrinsics is False).",
+            default=True,
+        )
+        self.parser.add_argument(
+            "--hamlyn_intrinsics_filename",
+            type=str,
+            help="(Hamlyn) Intrinsics filename inside each sequence folder.",
+            default="intrinsics.txt",
+        )
+
         # TRAINING options
         self.parser.add_argument(
             "--model_name",

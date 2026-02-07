@@ -251,16 +251,30 @@ class Trainer:
             num_train_samples // self.opt.batch_size * self.opt.num_epochs
         )
 
-        train_dataset = self.dataset(
-            self.opt.data_path,
-            train_filenames,
-            self.opt.height,
-            self.opt.width,
-            self.opt.frame_ids,
-            4,
-            is_train=True,
-            img_ext=img_ext,
-        )
+        if self.opt.dataset == "hamlyn":
+            train_dataset = self.dataset(
+                self.opt.data_path,
+                train_filenames,
+                self.opt.height,
+                self.opt.width,
+                self.opt.frame_ids,
+                4,
+                is_train=True,
+                img_ext=img_ext,
+                use_intrinsics_file=(not self.opt.learn_intrinsics) and getattr(self.opt, "hamlyn_use_intrinsics_file", True),
+                intrinsics_filename=getattr(self.opt, "hamlyn_intrinsics_filename", "intrinsics.txt"),
+            )
+        else:
+            train_dataset = self.dataset(
+                self.opt.data_path,
+                train_filenames,
+                self.opt.height,
+                self.opt.width,
+                self.opt.frame_ids,
+                4,
+                is_train=True,
+                img_ext=img_ext,
+            )
         self.train_loader = DataLoader(
             train_dataset,
             self.opt.batch_size,
@@ -269,16 +283,30 @@ class Trainer:
             pin_memory=True,
             drop_last=True,
         )
-        val_dataset = self.dataset(
-            self.opt.data_path,
-            val_filenames,
-            self.opt.height,
-            self.opt.width,
-            self.opt.frame_ids,
-            4,
-            is_train=False,
-            img_ext=img_ext,
-        )
+        if self.opt.dataset == "hamlyn":
+            val_dataset = self.dataset(
+                self.opt.data_path,
+                val_filenames,
+                self.opt.height,
+                self.opt.width,
+                self.opt.frame_ids,
+                4,
+                is_train=False,
+                img_ext=img_ext,
+                use_intrinsics_file=(not self.opt.learn_intrinsics) and getattr(self.opt, "hamlyn_use_intrinsics_file", True),
+                intrinsics_filename=getattr(self.opt, "hamlyn_intrinsics_filename", "intrinsics.txt"),
+            )
+        else:
+            val_dataset = self.dataset(
+                self.opt.data_path,
+                val_filenames,
+                self.opt.height,
+                self.opt.width,
+                self.opt.frame_ids,
+                4,
+                is_train=False,
+                img_ext=img_ext,
+            )
         self.val_loader = DataLoader(
             val_dataset,
             self.opt.batch_size,
@@ -287,16 +315,30 @@ class Trainer:
             pin_memory=True,
             drop_last=True,
         )
-        test_dataset = self.dataset(
-            self.opt.data_path,
-            test_filenames,
-            self.opt.height,
-            self.opt.width,
-            self.opt.frame_ids,
-            4,
-            is_train=False,
-            img_ext=img_ext,
-        )
+        if self.opt.dataset == "hamlyn":
+            test_dataset = self.dataset(
+                self.opt.data_path,
+                test_filenames,
+                self.opt.height,
+                self.opt.width,
+                self.opt.frame_ids,
+                4,
+                is_train=False,
+                img_ext=img_ext,
+                use_intrinsics_file=(not self.opt.learn_intrinsics) and getattr(self.opt, "hamlyn_use_intrinsics_file", True),
+                intrinsics_filename=getattr(self.opt, "hamlyn_intrinsics_filename", "intrinsics.txt"),
+            )
+        else:
+            test_dataset = self.dataset(
+                self.opt.data_path,
+                test_filenames,
+                self.opt.height,
+                self.opt.width,
+                self.opt.frame_ids,
+                4,
+                is_train=False,
+                img_ext=img_ext,
+            )
         self.test_loader = DataLoader(
             test_dataset,
             1,
@@ -1193,13 +1235,28 @@ class Trainer:
                         disp = _to_depth_image(outputs[("disp", 0)][j, 0])
                         log_dict[f"{mode}/disp_{j}"] = wandb.Image(disp)
 
-            # intrinsics prediction K (if you are learning intrinsics)
+            # intrinsics K (learned or fixed)
             if getattr(self.opt, "learn_intrinsics", False) and ("K", 0) in outputs:
                 K = outputs[("K", 0)][0].detach().cpu().numpy()  # first in batch
                 log_dict[f"{mode}/K_fx"] = float(K[0, 0])
                 log_dict[f"{mode}/K_fy"] = float(K[1, 1])
                 log_dict[f"{mode}/K_cx"] = float(K[0, 2])
                 log_dict[f"{mode}/K_cy"] = float(K[1, 2])
+                log_dict[f"{mode}/K_is_learned"] = 1.0
+            elif (not getattr(self.opt, "learn_intrinsics", False)) and (("K", 0) in inputs):
+                K = inputs[("K", 0)][0].detach().cpu().numpy()  # first in batch
+                log_dict[f"{mode}/K_fx"] = float(K[0, 0])
+                log_dict[f"{mode}/K_fy"] = float(K[1, 1])
+                log_dict[f"{mode}/K_cx"] = float(K[0, 2])
+                log_dict[f"{mode}/K_cy"] = float(K[1, 2])
+                log_dict[f"{mode}/K_is_learned"] = 0.0
+                if "intrinsics_from_file" in inputs:
+                    # 1 if intrinsics.txt was successfully used for this sample (0 = fallback)
+                    try:
+                        log_dict[f"{mode}/K_from_intrinsics_txt"] = float(inputs["intrinsics_from_file"][0].item())
+                    except Exception:
+                        pass
+
 
             # Include additional metrics for easier monitoring
             # Log the total loss explicitly to highlight convergence
