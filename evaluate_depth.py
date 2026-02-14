@@ -275,7 +275,7 @@ def evaluate(opt):
 
         pred_disp = pred_disps[i]
         pred_disp = cv2.resize(pred_disp, (gt_w, gt_h))
-        pred_depth = 1.0 / pred_disp
+        pred_depth = 1.0 / np.maximum(pred_disp, 1e-6)
 
         mask = np.logical_and(gt_depth > MIN_DEPTH, gt_depth < MAX_DEPTH)
 
