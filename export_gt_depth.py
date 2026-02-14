@@ -33,6 +33,15 @@ def export_gt_depths_kitti():
                         type=str,
                         default=None,
                         help='optional path to a custom split file (e.g. test_files.txt). Overrides the default file in splits/<split>/')
+
+
+    # Hamlyn split files are typically 1-based (frame 1 corresponds to 0000000000.png).
+    # This offset is applied ONLY when opt.split == "hamlyn".
+    # Set to 0 if your split file uses 0-based indexing.
+    parser.add_argument('--hamlyn_frame_id_offset',
+                        type=int,
+                        default=-1,
+                        help='Offset to apply to Hamlyn frame_id when reading depth files (default: -1 for 1-based split files).')
     opt = parser.parse_args()
 
     # Decide which file list to use and where to save the output
@@ -143,7 +152,12 @@ def export_gt_depths_kitti():
                 depth_base = os.path.join(seq_path, depth_sub)
 
             # Build candidate depth file names by trying multiple extensions
-            fname = f"{frame_id:010d}"
+            # Hamlyn splits in this repo are 1-based (frame 1 -> 0000000000.png),
+            # so apply an offset (default: -1). Clamp at 0 for safety.
+            frame_id_adj = frame_id + getattr(opt, "hamlyn_frame_id_offset", -1)
+            if frame_id_adj < 0:
+                frame_id_adj = 0
+            fname = f"{frame_id_adj:010d}"
             exts = [".tiff", ".tif", ".png", ".jpg", ".jpeg"]
             depth_path = None
             candidate_paths = []
