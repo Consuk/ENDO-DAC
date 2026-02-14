@@ -184,9 +184,8 @@ def load_model(opt):
 
 
 def evaluate(opt):
-    MIN_DEPTH = opt.min_depth
-MAX_DEPTH = opt.max_depth
-
+    MIN_DEPTH = 1e-3
+    MAX_DEPTH = 150
 
     assert sum((opt.eval_mono, opt.eval_stereo)) == 1, \
         "Choose mono or stereo with --eval_mono or --eval_stereo"
@@ -253,7 +252,6 @@ MAX_DEPTH = opt.max_depth
             +            f"Check that the GT .npz was generated from the SAME filelist used here:\n"
             f"  filelist: {eval_filelist_path}\n"
             f"  gt_npz:   {gt_depths_path}"
-            # new change
         )
 
     # ----------------------------
