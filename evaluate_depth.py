@@ -252,6 +252,7 @@ def evaluate(opt):
             +            f"Check that the GT .npz was generated from the SAME filelist used here:\n"
             f"  filelist: {eval_filelist_path}\n"
             f"  gt_npz:   {gt_depths_path}"
+            # new change
         )
 
     # ----------------------------
