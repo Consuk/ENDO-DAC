@@ -33,20 +33,28 @@ cv2.setNumThreads(0)
 splits_dir = os.path.join(os.path.dirname(__file__), "splits")
 
 
-def load_gt_depths_npz(eval_split: str):
-    gt_path = os.path.join(splits_dir, eval_split, "gt_depths.npz")
+def load_gt_depths_npz(eval_split: str, gt_depths_path: str = None):
+    """
+    Default: splits/<eval_split>/gt_depths.npz
+    Override: --gt_depths_path /path/to/custom_gt_depths.npz
+    """
+    if gt_depths_path is not None:
+        gt_path = os.path.expanduser(gt_depths_path)
+    else:
+        gt_path = os.path.join(splits_dir, eval_split, "gt_depths.npz")
+
     if not os.path.exists(gt_path):
         raise FileNotFoundError(
             f"Missing GT file: {gt_path}\n"
-            f"Generate it with export_gt_depth.py for split='{eval_split}'."
+            f"Generate it with export_gt_depth.py for split='{eval_split}', "
+            f"or pass --gt_depths_path to point to your custom .npz."
         )
+
     data_npz = np.load(gt_path, fix_imports=True, encoding="latin1", allow_pickle=True)
     gt_depths = data_npz["data"]
-    # Some npz files are saved as object arrays; convert to list for safety
     if isinstance(gt_depths, np.ndarray) and gt_depths.dtype == object:
         gt_depths = list(gt_depths)
-    return gt_depths
-
+    return gt_depths, gt_path
 
 def build_dataset_and_loader(opt):
     """
@@ -70,10 +78,17 @@ def build_dataset_and_loader(opt):
     dataset_cls = datasets_dict.get(dataset_key, datasets.SCAREDRAWDataset)
 
     # Load test filenames exactly like trainer does (but for eval_split)
-    fpath = os.path.join(splits_dir, opt.eval_split, "test_files.txt")
-    if not os.path.exists(fpath):
-        raise FileNotFoundError(f"Missing split file: {fpath}")
+    # Load test filenames (default: splits/<eval_split>/test_files.txt, override: --eval_filelist)
+    if getattr(opt, "eval_filelist", None):
+        fpath = os.path.expanduser(opt.eval_filelist)
+    else:
+        fpath = os.path.join(splits_dir, opt.eval_split, "test_files.txt")
 
+    if not os.path.exists(fpath):
+        raise FileNotFoundError(
+            f"Missing split file: {fpath}\n"
+            f"Either create splits/{opt.eval_split}/test_files.txt or pass --eval_filelist."
+        )
     filenames = readlines(fpath)
 
     # img_ext matches trainer's hamlyn override
@@ -106,7 +121,7 @@ def build_dataset_and_loader(opt):
         drop_last=False,
     )
 
-    return dataset, loader, filenames
+    return dataset, loader, filenames, fpath
 
 
 def load_model(opt):
@@ -189,10 +204,13 @@ def evaluate(opt):
     # ----------------------------
     # Trainer-style dataset creation
     # ----------------------------
-    dataset, dataloader, filenames = build_dataset_and_loader(opt)
+    dataset, dataloader, filenames, eval_filelist_path = build_dataset_and_loader(opt)
 
-    # Load GT depths for eval_split
-    gt_depths = load_gt_depths_npz(opt.eval_split)
+    # Load GT depths (allow override)
+    gt_depths, gt_depths_path = load_gt_depths_npz(opt.eval_split, getattr(opt, "gt_depths_path", None))
+
+    print(f"-> Using eval filelist: {eval_filelist_path}")
+    print(f"-> Using gt depths:    {gt_depths_path}")
 
     # ----------------------------
     # Predict
@@ -231,8 +249,9 @@ def evaluate(opt):
     if pred_disps.shape[0] != len(gt_depths):
         raise AssertionError(
             f"Mismatch: {pred_disps.shape[0]} predictions vs {len(gt_depths)} gt depth maps.\n"
-            f"Check that gt_depths.npz was generated from the SAME test_files.txt used here:\n"
-            f"  splits/{opt.eval_split}/test_files.txt"
+            +            f"Check that the GT .npz was generated from the SAME filelist used here:\n"
+            f"  filelist: {eval_filelist_path}\n"
+            f"  gt_npz:   {gt_depths_path}"
         )
 
     # ----------------------------

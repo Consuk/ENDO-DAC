@@ -355,6 +355,24 @@ class MonodepthOptions:
             help="which split to run eval on",
         )
         self.parser.add_argument(
+            "--eval_filelist",
+            type=str,
+            default=None,
+            help=(
+                "(Optional) Override evaluation file list path (e.g., /.../test_files2.txt). "
+                "If not set, uses splits/<eval_split>/test_files.txt"
+            ),
+        )
+        self.parser.add_argument(
+            "--gt_depths_path",
+            type=str,
+            default=None,
+            help=(
+                "(Optional) Override GT depths .npz path (e.g., /.../test_files2_gt_depths.npz). "
+                "If not set, uses splits/<eval_split>/gt_depths.npz"
+            ),
+        )
+        self.parser.add_argument(
             "--save_pred_disps",
             help="if set saves predicted disparities",
             action="store_true",
