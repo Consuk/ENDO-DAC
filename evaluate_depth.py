@@ -184,8 +184,9 @@ def load_model(opt):
 
 
 def evaluate(opt):
-    MIN_DEPTH = 1e-3
-    MAX_DEPTH = 150
+    MIN_DEPTH = opt.min_depth
+MAX_DEPTH = opt.max_depth
+
 
     assert sum((opt.eval_mono, opt.eval_stereo)) == 1, \
         "Choose mono or stereo with --eval_mono or --eval_stereo"
