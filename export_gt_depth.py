@@ -74,12 +74,22 @@ def _decode_hamlyn_gt(raw: np.ndarray,
     elif gt_format == "disparity":
         if fx is None or baseline is None:
             raise ValueError("hamlyn_gt_format=disparity requires --hamlyn_fx and --hamlyn_baseline")
-        disp = gt
-        disp = disp.astype(np.float32)
+
+        disp = gt.astype(np.float32)
+
+        # If disparity is stored as fixed-point (disp * 256) in uint16,
+        # values will typically be >> 255. Convert back to pixel disparity.
+        # Heuristic: if max > 512, it's almost certainly fixed-point x256.
+        mx = np.nanmax(disp) if disp.size else 0.0
+        if mx > 512:
+            disp = disp / 256.0
+
         disp[disp <= 0] = np.nan
         depth = (fx * baseline) / disp
         depth = np.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
         gt = depth * depth_scale
+
 
     elif gt_format == "inv_depth":
         inv = gt.astype(np.float32)
