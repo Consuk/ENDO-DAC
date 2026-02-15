@@ -199,7 +199,7 @@ def export_gt_depths_kitti():
             if gt_depth is None:
                 raise RuntimeError(f"cv2.imread failed for {depth_path}")
             gt_depth = gt_depth.astype(np.float32)
-            # If multi-channel, keep first channel
+            # If multi-channel, keep first channel BORRAR LUEGO
             if gt_depth.ndim == 3:
                 gt_depth = gt_depth[:, :, 0]
 
