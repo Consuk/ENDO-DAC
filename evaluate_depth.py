@@ -54,6 +54,8 @@ def load_gt_depths_npz(eval_split: str, gt_depths_path: str = None):
     gt_depths = data_npz["data"]
     if isinstance(gt_depths, np.ndarray) and gt_depths.dtype == object:
         gt_depths = list(gt_depths)
+    gt_depths = [np.asarray(g, dtype=np.float32) for g in gt_depths]
+
     return gt_depths, gt_path
 
 
@@ -293,7 +295,8 @@ def evaluate(opt):
     ratios = []
 
     for i in range(pred_disps.shape[0]):
-        gt_depth = gt_depths[i]
+        gt_depth = np.asarray(gt_depths[i], dtype=np.float32)
+
         gt_h, gt_w = gt_depth.shape[:2]
 
         pred_disp = pred_disps[i]
@@ -313,7 +316,13 @@ def evaluate(opt):
         pred_depth[pred_depth < MIN_DEPTH] = MIN_DEPTH
         pred_depth[pred_depth > MAX_DEPTH] = MAX_DEPTH
 
+
+
+        gt_valid = np.asarray(gt_valid, dtype=np.float32)
+        pred_depth = np.asarray(pred_depth, dtype=np.float32)
+
         err = compute_errors(gt_valid, pred_depth)
+
         errors.append(err)
 
     if not opt.disable_median_scaling:
