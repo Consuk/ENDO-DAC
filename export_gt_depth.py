@@ -34,6 +34,11 @@ def export_gt_depths_kitti():
                         default=None,
                         help='optional path to a custom split file (e.g. test_files.txt). Overrides the default file in splits/<split>/')
 
+    parser.add_argument('--output_path',
+                    type=str,
+                    default=None,
+                    help='Optional: explicit output npz path (overrides default naming).')
+
     # Hamlyn split files are typically 1-based (frame 1 corresponds to 0000000000.png).
     # This offset is applied ONLY when opt.split == "hamlyn".
     # Set to 0 if your split file uses 0-based indexing.
@@ -62,6 +67,8 @@ def export_gt_depths_kitti():
         else:
             split_file = os.path.join(split_folder, "3d_reconstruction.txt")
             output_path = os.path.join(split_folder, "gt_depths_recon.npz")
+    if opt.output_path:
+        output_path = os.path.expanduser(opt.output_path)
 
     # Read the list of files
     lines = readlines(split_file)
