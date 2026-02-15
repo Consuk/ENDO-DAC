@@ -56,6 +56,7 @@ def load_gt_depths_npz(eval_split: str, gt_depths_path: str = None):
         gt_depths = list(gt_depths)
     return gt_depths, gt_path
 
+
 def build_dataset_and_loader(opt):
     """
     Trainer-style dataset wiring:
@@ -65,19 +66,25 @@ def build_dataset_and_loader(opt):
       - frame_ids used for evaluation: [0]
     """
     # Choose dataset key similar to trainer:
-    # trainer uses opt.dataset for selecting class, opt.split for filelists
     dataset_key = getattr(opt, "dataset", None) or opt.eval_split
 
+    # Keep explicit mapping; do not silently fall back to a different dataset.
     datasets_dict = {
-        "endovis": datasets.SCAREDRAWDataset,  # trainer maps "endovis" -> SCAREDRAWDataset
-        "hamlyn": HamlynDataset,               # trainer maps "hamlyn" -> HamlynDataset
+        "endovis": SCAREDRAWDataset,
+        "hamlyn": HamlynDataset,
     }
     if C3VDDataset is not None:
         datasets_dict["c3vd"] = C3VDDataset
 
-    dataset_cls = datasets_dict.get(dataset_key, datasets.SCAREDRAWDataset)
+    if dataset_key not in datasets_dict:
+        raise ValueError(
+            f"Unknown dataset '{dataset_key}'. "
+            f"Expected one of: {sorted(datasets_dict.keys())}. "
+            f"Set --dataset correctly (e.g., --dataset hamlyn)."
+        )
 
-    # Load test filenames exactly like trainer does (but for eval_split)
+    dataset_cls = datasets_dict[dataset_key]
+
     # Load test filenames (default: splits/<eval_split>/test_files.txt, override: --eval_filelist)
     if getattr(opt, "eval_filelist", None):
         fpath = os.path.expanduser(opt.eval_filelist)
@@ -220,8 +227,25 @@ def evaluate(opt):
         print(f"-> Computing predictions with size {opt.width}x{opt.height}")
         pred_disps_list = []
 
+        printed_intrinsics_debug = False
+
         with torch.no_grad():
             for _, data in tqdm(enumerate(dataloader), total=len(dataloader)):
+                # ---- DEBUG: verify Hamlyn intrinsics are actually loaded from intrinsics.txt ----
+                if (not printed_intrinsics_debug) and ("intrinsics_from_file" in data):
+                    try:
+                        intr_flag = data["intrinsics_from_file"]
+                        uniq = torch.unique(intr_flag).detach().cpu().tolist()
+                        print(f"[DEBUG] Intrinsics loaded from file? unique flags in batch: {uniq} (1=file, 0=fallback)")
+                        if int(torch.max(intr_flag).item()) == 1:
+                            if (("K", 0) in data):
+                                print(f"[DEBUG] Sample K (first item):\n{data[('K', 0)][0].detach().cpu().numpy()}")
+                        else:
+                            print("[WARNING] Fallback intrinsics in use — check intrinsics.txt path / hamlyn_use_intrinsics_file flags!")
+                    except Exception as e:
+                        print(f"[DEBUG] Could not print intrinsics debug info: {e}")
+                    printed_intrinsics_debug = True
+
                 input_color = data[("color", 0, 0)].cuda()
 
                 if opt.post_process:
@@ -237,7 +261,6 @@ def evaluate(opt):
                 pred_disp, _ = disp_to_depth(output[("disp", 0)], opt.min_depth, opt.max_depth)
                 pred_disp = pred_disp.cpu()[:, 0].numpy()  # (B,H,W)
 
-                # Keep behavior consistent with your current eval script: no batch post-process merge
                 pred_disps_list.append(pred_disp)
 
         pred_disps = np.concatenate(pred_disps_list, axis=0)
@@ -249,7 +272,7 @@ def evaluate(opt):
     if pred_disps.shape[0] != len(gt_depths):
         raise AssertionError(
             f"Mismatch: {pred_disps.shape[0]} predictions vs {len(gt_depths)} gt depth maps.\n"
-            +            f"Check that the GT .npz was generated from the SAME filelist used here:\n"
+            f"Check that the GT .npz was generated from the SAME filelist used here:\n"
             f"  filelist: {eval_filelist_path}\n"
             f"  gt_npz:   {gt_depths_path}"
         )
@@ -282,9 +305,6 @@ def evaluate(opt):
         pred_depth = pred_depth[mask]
         gt_valid = gt_depth[mask]
 
-        # If you want to apply scale factor like some KITTI pipelines:
-        # pred_depth *= opt.pred_depth_scale_factor
-
         if not opt.disable_median_scaling:
             ratio = np.median(gt_valid) / np.median(pred_depth)
             ratios.append(ratio)
@@ -304,7 +324,7 @@ def evaluate(opt):
     errors = np.array(errors)
     mean_errors = np.mean(errors, axis=0)
 
-    # Confidence intervals (keep your existing feature)
+    # Confidence intervals
     cls = []
     for k in range(len(mean_errors)):
         cl = st.t.interval(

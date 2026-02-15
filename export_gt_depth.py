@@ -34,7 +34,6 @@ def export_gt_depths_kitti():
                         default=None,
                         help='optional path to a custom split file (e.g. test_files.txt). Overrides the default file in splits/<split>/')
 
-
     # Hamlyn split files are typically 1-based (frame 1 corresponds to 0000000000.png).
     # This offset is applied ONLY when opt.split == "hamlyn".
     # Set to 0 if your split file uses 0-based indexing.
@@ -151,12 +150,20 @@ def export_gt_depths_kitti():
                 depth_sub = 'depth02' if side and side.lower().startswith('r') else 'depth01'
                 depth_base = os.path.join(seq_path, depth_sub)
 
+            # ---- DEBUG: confirm which depth folder we are using (depth01 vs depth02) ----
+            used_depth_dir = "depth02" if (os.sep + "depth02") in (os.sep + depth_base) or depth_base.endswith("depth02") else "depth01"
+            side_flag = (side or "l").lower()[0]
+            expected = "depth02" if side_flag == "r" else "depth01"
+            print(f"[DEBUG] {folder} | frame_id {frame_id} | side '{side_flag}' | using {used_depth_dir} (expected {expected}) | depth_base={depth_base}")
+
             # Build candidate depth file names by trying multiple extensions
             # Hamlyn splits in this repo are 1-based (frame 1 -> 0000000000.png),
             # so apply an offset (default: -1). Clamp at 0 for safety.
             frame_id_adj = frame_id + getattr(opt, "hamlyn_frame_id_offset", -1)
             if frame_id_adj < 0:
                 frame_id_adj = 0
+            print(f"[DEBUG] {folder} | raw frame_id={frame_id} | hamlyn_frame_id_offset={getattr(opt,'hamlyn_frame_id_offset',-1)} | adjusted={frame_id_adj}")
+
             fname = f"{frame_id_adj:010d}"
             exts = [".tiff", ".tif", ".png", ".jpg", ".jpeg"]
             depth_path = None
@@ -174,7 +181,6 @@ def export_gt_depths_kitti():
                     depth_path = cand
                     break
             if depth_path is None:
-                # Prepare informative error message
                 search_paths = [os.path.join(opt.data_path, depth_base),
                                 split_base_data_path and os.path.join(split_base_data_path, depth_base)]
                 search_paths_str = ", ".join([p for p in search_paths if p])
@@ -198,8 +204,7 @@ def export_gt_depths_kitti():
             gt_depths.append(gt_depth.astype(np.float32))
 
     print("Saving to {}".format(output_path))
-    # np.savez_compressed(output_path, data=np.array(gt_depths))
-    
+
     # Some Hamlyn depth maps have different shapes (H, W),
     # so we store them as an object array instead of forcing
     # a single (N, H, W) tensor.
