@@ -303,7 +303,9 @@ def evaluate(opt):
         pred_disp = cv2.resize(pred_disp, (gt_w, gt_h))
         pred_depth = 1.0 / np.maximum(pred_disp, 1e-6)
 
-        mask = np.logical_and(gt_depth > MIN_DEPTH, gt_depth < MAX_DEPTH)
+        gt_depth[gt_depth >= 65535 - 1e-3] = 0.0
+
+        mask = (gt_depth > MIN_DEPTH) & (gt_depth < MAX_DEPTH)
 
         pred_depth = pred_depth[mask]
         gt_valid = gt_depth[mask]
