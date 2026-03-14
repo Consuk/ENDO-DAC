@@ -29,14 +29,13 @@ import models.endodac as endodac
 
 
 cv2.setNumThreads(0)
-splits_dir = os.path.join(os.path.dirname(__file__), "splits")
 
 
 class EvalOptions:
     pass
 
 
-def load_gt_depths_npz(eval_split: str, gt_depths_path: str = None):
+def load_gt_depths_npz(eval_split: str, splits_dir: str, gt_depths_path: str = None):
     if gt_depths_path is not None:
         gt_path = os.path.expanduser(gt_depths_path)
     else:
@@ -81,12 +80,12 @@ def build_dataset_and_loader(opt):
     if getattr(opt, "eval_filelist", None):
         fpath = os.path.expanduser(opt.eval_filelist)
     else:
-        fpath = os.path.join(splits_dir, opt.eval_split, "test_files.txt")
+        fpath = os.path.join(opt.splits_dir, opt.eval_split, "test_files.txt")
 
     if not os.path.exists(fpath):
         raise FileNotFoundError(
             f"Missing split file: {fpath}\n"
-            f"Either create splits/{opt.eval_split}/test_files.txt or pass --eval_filelist."
+            f"Either create {opt.splits_dir}/{opt.eval_split}/test_files.txt or pass --eval_filelist."
         )
     filenames = readlines(fpath)
 
@@ -133,13 +132,19 @@ def load_model(opt):
     if not os.path.isfile(depther_path):
         raise FileNotFoundError(f"Cannot find EndoDAC weights: {depther_path}")
 
+    if opt.height % 14 != 0 or opt.width % 14 != 0:
+        raise ValueError(
+            f"EndoDAC requires height and width to be multiples of 14. "
+            f"Got height={opt.height}, width={opt.width}."
+        )
+
     depther_dict = torch.load(depther_path, map_location="cpu")
 
     depther = endodac.endodac(
         backbone_size="base",
         r=opt.lora_rank,
         lora_type=opt.lora_type,
-        image_shape=(224, 280),
+        image_shape=(opt.height, opt.width),
         pretrained_path=opt.pretrained_path,
         residual_block_indexes=opt.residual_block_indexes,
         include_cls_token=opt.include_cls_token,
@@ -271,7 +276,7 @@ def evaluate_one_root(opt, depther, gt_depths):
     if len(errors) == 0:
         raise RuntimeError(f"No valid depth metrics could be computed for {opt.data_path}")
 
-    if not opt.disable_median_scaling:
+    if not opt.disable_median_scaling and len(ratios) > 0:
         ratios = np.array(ratios)
         med = np.median(ratios)
         print(" Scaling ratios | med: {:0.3f} | std: {:0.3f}".format(med, np.std(ratios / med)))
@@ -339,6 +344,7 @@ def build_opt_from_args(args, data_path_root):
     opt.eval_filelist = args.eval_filelist
     opt.gt_depths_path = args.gt_depths_path
     opt.img_ext = args.img_ext
+    opt.splits_dir = args.splits_dir
 
     opt.load_weights_folder = args.load_weights_folder
     opt.lora_rank = args.lora_rank
@@ -356,6 +362,7 @@ def main():
     parser.add_argument("--load_weights_folder", type=str, required=True,
                         help="Folder containing EndoDAC depth_model.pth")
     parser.add_argument("--split", type=str, default="hamlyn")
+    parser.add_argument("--splits_dir", type=str, default=os.path.join(os.path.dirname(__file__), "splits"))
     parser.add_argument("--dataset", type=str, default="hamlyn", choices=["hamlyn", "endovis", "scared", "c3vd"])
     parser.add_argument("--data_subdir", type=str, default="",
                         help="Optional subdir inside each severity folder for non-Hamlyn datasets")
@@ -388,11 +395,13 @@ def main():
     parser.add_argument("--ci_filename", type=str, default="confidence_intervals_by_severity.csv")
     args = parser.parse_args()
 
+    args.splits_dir = os.path.expanduser(args.splits_dir)
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device != "cuda":
         raise RuntimeError("This script expects CUDA just like the current evaluate_depth.py flow.")
 
-    gt_depths, gt_depths_path = load_gt_depths_npz(args.split, args.gt_depths_path)
+    gt_depths, gt_depths_path = load_gt_depths_npz(args.split, args.splits_dir, args.gt_depths_path)
     print(f"-> Using gt depths:    {gt_depths_path}")
 
     first_opt = build_opt_from_args(args, data_path_root="")
@@ -491,10 +500,10 @@ def main():
     save_csv(global_csv, per_corr_header, [["global"] + global_means])
 
     print("\n======= SUMMARY =======")
-    print("By severity        :", summary_csv)
+    print("By severity         :", summary_csv)
     print("Confidence intervals:", ci_csv)
-    print("By corruption      :", per_corr_csv)
-    print("Global             :", global_csv)
+    print("By corruption       :", per_corr_csv)
+    print("Global              :", global_csv)
 
 
 if __name__ == "__main__":
