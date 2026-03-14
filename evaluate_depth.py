@@ -153,7 +153,7 @@ def load_model(opt):
             backbone_size="base",
             r=opt.lora_rank,
             lora_type=opt.lora_type,
-            image_shape=(256, 320),
+            image_shape=(224, 280),
             pretrained_path=opt.pretrained_path,
             residual_block_indexes=opt.residual_block_indexes,
             include_cls_token=opt.include_cls_token,
