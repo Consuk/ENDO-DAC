@@ -1,302 +1,154 @@
-# eval_endovis_corruptions.py
 from __future__ import absolute_import, division, print_function
 
 import os
-import argparse
 import csv
-import numpy as np
-import cv2
+import argparse
 from collections import defaultdict
 
+import cv2
+import numpy as np
 import torch
 
-from datasets import SCAREDRAWDataset
+import networks
+import datasets
 
-# ---------- imports alineados a tu estructura utils/ ----------
-# readlines + compute_errors están en utils/utils.py (según tu archivo)
-try:
-    from utils.utils import readlines, compute_errors
-except ImportError:
-    from utils import readlines, compute_errors
-
-# disp_to_depth está en utils/layers.py (según tu archivo)
-try:
-    from utils.layers import disp_to_depth
-except ImportError:
-    from utils import disp_to_depth
-
-try:
-    from PIL import Image as PILImage
-except Exception as e:
-    raise ImportError("Pillow es requerido: pip install pillow") from e
+from utils import readlines
+from layers import disp_to_depth
 
 
-# ===== Constantes/metas =====
 STEREO_SCALE_FACTOR = 5.4
-MIN_DEPTH = 1e-3
-MAX_DEPTH = 150.0
 
 
-# ===================== ENDODAC LOADER (solo models/, nombres reales) =====================
+def compute_errors(gt, pred):
+    """Métricas estándar de profundidad."""
+    thresh = np.maximum((gt / pred), (pred / gt))
+    a1 = (thresh < 1.25).mean()
+    a2 = (thresh < 1.25 ** 2).mean()
+    a3 = (thresh < 1.25 ** 3).mean()
+
+    rmse = np.sqrt(((gt - pred) ** 2).mean())
+    rmse_log = np.sqrt(((np.log(gt) - np.log(pred)) ** 2).mean())
+    abs_rel = np.mean(np.abs(gt - pred) / gt)
+    sq_rel = np.mean(((gt - pred) ** 2) / gt)
+
+    return abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3
+
+
 def load_model(load_weights_folder, num_layers, device):
-    """
-    Carga pesos Endo-DAC (DepthAnything ViT + depth_model).
-    Nombres soportados:
-      - encoder.pth / depth.pth (si existieran)
-      - depth_anything*.pth (encoder)
-      - depth_model.pth (depth head EndoDAC)
-    No depende de networks/ porque en tu estructura no existe.
-    """
-    import importlib, pkgutil, inspect
+    """Carga encoder y decoder una sola vez."""
+    encoder_path = os.path.join(load_weights_folder, "encoder.pth")
+    decoder_path = os.path.join(load_weights_folder, "depth.pth")
 
     if not os.path.isdir(load_weights_folder):
-        raise FileNotFoundError(f"Cannot find weights folder: {load_weights_folder}")
+        raise FileNotFoundError(f"No existe la carpeta de pesos: {load_weights_folder}")
+    if not os.path.isfile(encoder_path):
+        raise FileNotFoundError(f"No existe {encoder_path}")
+    if not os.path.isfile(decoder_path):
+        raise FileNotFoundError(f"No existe {decoder_path}")
 
-    # ---- resolver nombres de archivo ----
-    encoder_candidates = [
-        "encoder.pth",
-        "depth_anything_vitb14.pth",
-    ]
-    encoder_candidates += sorted([
-        f for f in os.listdir(load_weights_folder)
-        if f.startswith("depth_anything") and f.endswith(".pth")
-    ])
-
-    decoder_candidates = [
-        "depth.pth",
-        "depth_model.pth",
-    ]
-
-    encoder_path = None
-    for name in encoder_candidates:
-        p = os.path.join(load_weights_folder, name)
-        if os.path.isfile(p):
-            encoder_path = p
-            break
-
-    decoder_path = None
-    for name in decoder_candidates:
-        p = os.path.join(load_weights_folder, name)
-        if os.path.isfile(p):
-            decoder_path = p
-            break
-
-    if encoder_path is None or decoder_path is None:
-        raise FileNotFoundError(
-            "Missing EndoDAC weights. Busqué encoder en: "
-            f"{encoder_candidates} y decoder en: {decoder_candidates} dentro de {load_weights_folder}"
-        )
-
-    print(f"   [INFO] Encoder weights: {os.path.basename(encoder_path)}")
-    print(f"   [INFO] Decoder weights: {os.path.basename(decoder_path)}")
+    encoder = networks.ResnetEncoder(num_layers, False)
+    depth_decoder = networks.DepthDecoder(encoder.num_ch_enc, scales=range(4))
 
     encoder_dict = torch.load(encoder_path, map_location=device)
-    depth_dict   = torch.load(decoder_path, map_location=device)
+    filtered_dict = {k: v for k, v in encoder_dict.items() if k in encoder.state_dict()}
+    encoder.load_state_dict(filtered_dict)
 
-    enc_keys = list(encoder_dict.keys())
-    dec_keys = list(depth_dict.keys())
-
-    def _looks_like_vit_state_dict(sd_keys):
-        vit_hints = ("patch_embed", "pos_embed", "blocks.", "transformer", "attn", "mlp", "norm")
-        return any(any(h in k for h in vit_hints) for k in sd_keys)
-
-    def _looks_like_endodac_decoder(sd_keys):
-        dec_hints = ("endodac", "reassemble", "fusion", "dpt", "head", "upsample", "refine")
-        return any(any(h in k.lower() for h in dec_hints) for k in sd_keys)
-
-    is_vit = _looks_like_vit_state_dict(enc_keys) or _looks_like_endodac_decoder(dec_keys)
-
-    # -------- auto-descubrir clases en models/ ----------
-    def iter_candidate_classes(patterns):
-        patterns = [p.lower() for p in patterns]
-        try:
-            pkg = importlib.import_module("models")
-        except Exception:
-            return
-
-        if hasattr(pkg, "__path__"):
-            for m in pkgutil.walk_packages(pkg.__path__, pkg.__name__ + "."):
-                try:
-                    mod = importlib.import_module(m.name)
-                except Exception:
-                    continue
-                for cname, cls in inspect.getmembers(mod, inspect.isclass):
-                    if cls.__module__ == mod.__name__ and any(p in cname.lower() for p in patterns):
-                        yield cls
-
-    def try_instantiate(cls, prefer_num_ch_enc=None):
-        try:
-            return cls()
-        except Exception:
-            pass
-        try:
-            return cls(scales=range(4))
-        except Exception:
-            pass
-        if prefer_num_ch_enc is not None:
-            try:
-                return cls(prefer_num_ch_enc, scales=range(4))
-            except Exception:
-                pass
-            try:
-                return cls(prefer_num_ch_enc)
-            except Exception:
-                pass
-        return None
-    # ----------------------------------------------------
-
-    if is_vit:
-        # ======= EndoDAC/ViT encoder + modelo depth =======
-        encoder_patterns = ["depthanything", "vit", "transformer", "encoder", "backbone"]
-        decoder_patterns = ["endodac", "depthmodel", "dpt", "decoder", "depth"]
-
-        enc = None
-        for cls in iter_candidate_classes(encoder_patterns):
-            if "resnet" in cls.__name__.lower():
-                continue
-            enc = try_instantiate(cls)
-            if enc is not None:
-                break
-        if enc is None:
-            raise RuntimeError("No se pudo construir encoder ViT desde models/.")
-
-        enc.load_state_dict(encoder_dict, strict=False)
-
-        dec = None
-        prefer_num_ch_enc = getattr(enc, "num_ch_enc", None)
-        for cls in iter_candidate_classes(decoder_patterns):
-            if "resnet" in cls.__name__.lower():
-                continue
-            dec = try_instantiate(cls, prefer_num_ch_enc=prefer_num_ch_enc)
-            if dec is not None:
-                break
-        if dec is None:
-            raise RuntimeError("No se pudo construir modelo/depth head EndoDAC desde models/.")
-
-        dec.load_state_dict(depth_dict, strict=False)
-
-        encoder = enc
-        depth_decoder = dec
-
-    else:
-        raise RuntimeError(
-            "Los pesos no parecen ViT/EndoDAC y no hay networks/. "
-            "Este script está pensado para Endo-DAC."
-        )
+    depth_decoder.load_state_dict(torch.load(decoder_path, map_location=device))
 
     encoder.to(device).eval()
     depth_decoder.to(device).eval()
+
     return encoder, depth_decoder
-# ===================== FIN ENDODAC LOADER =====================
 
 
-def evaluate_one_root(data_path_root,
-                      filenames,
-                      gt_depths,
-                      encoder,
-                      depth_decoder,
-                      height=256,
-                      width=320,
-                      batch_size=16,
-                      num_workers=4,
-                      png=False,
-                      disable_median_scaling=False,
-                      pred_depth_scale_factor=1.0,
-                      strict=False,
-                      device="cuda"):
+def build_dataset(dataset_name, data_path_root, filenames, height, width, png=False):
     """
-    Evalúa una raíz (corrupción/severidad) con EndoDAC.
+    Construye el dataset correcto según el nombre indicado.
     """
-    import inspect as pyinspect
+    img_ext = ".png" if png else ".jpg"
 
-    img_ext = '.png' if png else '.jpg'
-    dataset = SCAREDRAWDataset(
-        data_path_root, filenames, height, width,
-        [0], 4, is_train=False, img_ext=img_ext
-    )
+    if dataset_name.lower() == "hamlyn":
+        return datasets.HamlynDataset(
+            data_path_root,
+            filenames,
+            height,
+            width,
+            [0],
+            4,
+            is_train=False,
+            img_ext=img_ext,
+        )
 
-    n = len(filenames)
+    if dataset_name.lower() in ("endovis", "scared"):
+        return datasets.SCAREDRAWDataset(
+            data_path_root,
+            filenames,
+            height,
+            width,
+            [0],
+            4,
+            is_train=False,
+            img_ext=img_ext,
+        )
+
+    raise ValueError(f"Dataset no soportado: {dataset_name}")
+
+
+def evaluate_one_root(
+    data_path_root,
+    filenames,
+    gt_depths,
+    encoder,
+    depth_decoder,
+    dataset_name="hamlyn",
+    height=256,
+    width=320,
+    batch_size=16,
+    png=False,
+    disable_median_scaling=False,
+    pred_depth_scale_factor=1.0,
+    strict=False,
+    min_depth=1e-3,
+    max_depth=150.0,
+    device="cuda",
+):
+    """
+    Evalúa una raíz concreta.
+
+    Para Hamlyn, data_path_root debe ser la carpeta de severidad, por ejemplo:
+      /workspace/datasets/hamlyn/hamlyn_corruptions_test24/brightness/severity_1
+
+    y HamlynDataset resolverá dinámicamente:
+      rectified24 -> rectified24/rectified24 -> image01/image02
+    """
+    dataset = build_dataset(dataset_name, data_path_root, filenames, height, width, png=png)
+
+    preds_list = []
     kept_indices = []
-    preds_list   = []
 
     buffer_imgs = []
-    buffer_ids  = []
-
-    def _get_disp0(out):
-        """Extrae disp escala 0 desde dict/list/tensor."""
-        if isinstance(out, dict):
-            if ("disp", 0) in out:
-                return out[("disp", 0)]
-            if "disp" in out:
-                return out["disp"]
-            if ("pred_disp", 0) in out:
-                return out[("pred_disp", 0)]
-        if isinstance(out, (list, tuple)):
-            return out[0]
-        return out
+    buffer_ids = []
 
     def flush_buffer():
-        if len(buffer_imgs) == 0:
+        if not buffer_imgs:
             return
 
         with torch.no_grad():
-            batch = torch.stack(buffer_imgs, dim=0).to(device)  # [B,3,H,W]
-
-            # feats opcionales (pero EndoDAC winner suele NO usarlos en forward)
-            feats = None
-            if encoder is not None:
-                try:
-                    feats = encoder(batch)
-                except Exception:
-                    feats = None
-
-            # firma del forward del modelo EndoDAC
-            try:
-                sig = pyinspect.signature(depth_decoder.forward)
-                params = [p.name for p in sig.parameters.values() if p.name != "self"]
-            except Exception:
-                params = []
-
-            # --- Caso EndoDAC típico: forward(pixel_values) ---
-            if len(params) == 1:
-                out = depth_decoder(batch)
-            else:
-                # si el modelo acepta más args, intentamos pasar imagen+feats
-                called = False
-                if feats is None:
-                    out = depth_decoder(batch); called = True
-                else:
-                    if len(params) >= 2:
-                        p0, p1 = params[0].lower(), params[1].lower()
-                        if ("pixel" in p0) or ("image" in p0) or ("rgb" in p0):
-                            out = depth_decoder(batch, feats); called = True
-                        elif ("pixel" in p1) or ("image" in p1) or ("rgb" in p1):
-                            out = depth_decoder(feats, batch); called = True
-
-                    if not called:
-                        try:
-                            out = depth_decoder(feats); called = True
-                        except Exception:
-                            pass
-                    if not called:
-                        try:
-                            out = depth_decoder(batch, feats)
-                        except Exception:
-                            out = depth_decoder(feats, batch)
-
-            disp0 = _get_disp0(out)
-            pred_disp, _ = disp_to_depth(disp0, MIN_DEPTH, MAX_DEPTH)
-
-            if pred_disp.ndim == 4:
-                preds_list.append(pred_disp[:, 0].cpu().numpy())
-            else:
-                preds_list.append(pred_disp.cpu().numpy())
+            batch = torch.stack(buffer_imgs, dim=0).to(device)
+            features = encoder(batch)
+            outputs = depth_decoder(features)
+            pred_disp, _ = disp_to_depth(outputs[("disp", 0)], min_depth, max_depth)
+            preds_list.append(pred_disp[:, 0].cpu().numpy())
 
     missing = 0
-    for i in range(n):
+    total = len(filenames)
+    debug_shown = 0
+
+    for i in range(total):
         try:
             sample = dataset[i]
-            img_t  = sample[("color", 0, 0)]
+            img_t = sample[("color", 0, 0)]
+
             if not isinstance(img_t, torch.Tensor):
                 img_t = torch.as_tensor(img_t)
 
@@ -309,36 +161,67 @@ def evaluate_one_root(data_path_root,
                 buffer_imgs.clear()
                 buffer_ids.clear()
 
-        except Exception:
+        except FileNotFoundError as e:
             missing += 1
+            if debug_shown < 5:
+                print(f"   [DEBUG] idx={i} file='{filenames[i]}' FileNotFoundError: {e}")
+                debug_shown += 1
             if strict:
-                raise
+                raise FileNotFoundError(
+                    f"[STRICT] Falta la muestra idx={i} en {data_path_root}: {e}"
+                )
+        except Exception as e:
+            missing += 1
+            if debug_shown < 5:
+                print(f"   [DEBUG] idx={i} file='{filenames[i]}' error={repr(e)}")
+                debug_shown += 1
+            if strict:
+                raise RuntimeError(
+                    f"[STRICT] Error cargando idx={i} en {data_path_root}: {e}"
+                )
 
-    flush_buffer()
-    kept_indices.extend(buffer_ids)
+    if buffer_imgs:
+        flush_buffer()
+        kept_indices.extend(buffer_ids)
 
     if len(kept_indices) == 0:
         mode = "STRICT" if strict else "LENIENT"
         raise FileNotFoundError(
-            f"[{mode}] Ninguna imagen utilizable en {data_path_root} "
-            f"(faltantes/errores: {missing}/{n})."
+            f"[{mode}] Ninguna muestra utilizable en {data_path_root}. "
+            f"Faltantes/errores: {missing}/{total}"
+        )
+
+    if (not strict) and missing > 0:
+        print(
+            f"   [INFO] {data_path_root}: usando {len(kept_indices)}/{total} frames "
+            f"(faltaron {missing})."
         )
 
     pred_disps = np.concatenate(preds_list, axis=0)
-    sel_gt     = gt_depths[kept_indices]
 
-    errors, ratios = [], []
+    if isinstance(gt_depths, list):
+        sel_gt = [gt_depths[idx] for idx in kept_indices]
+    else:
+        sel_gt = gt_depths[kept_indices]
+
+    errors = []
+    ratios = []
+
     for i in range(pred_disps.shape[0]):
-        gt_depth = sel_gt[i]
+        gt_depth = np.asarray(sel_gt[i]).astype(np.float32)
         gt_h, gt_w = gt_depth.shape[:2]
 
         pred_disp = pred_disps[i]
         pred_disp = cv2.resize(pred_disp, (gt_w, gt_h))
         pred_depth = 1.0 / (pred_disp + 1e-8)
 
-        mask = np.logical_and(gt_depth > MIN_DEPTH, gt_depth < MAX_DEPTH)
-        pd = pred_depth[mask]
+        mask = np.logical_and(gt_depth > min_depth, gt_depth < max_depth)
+
         gd = gt_depth[mask]
+        pd = pred_depth[mask]
+
+        if pd.size == 0 or gd.size == 0:
+            continue
 
         if pred_depth_scale_factor != 1.0:
             pd *= pred_depth_scale_factor
@@ -348,9 +231,13 @@ def evaluate_one_root(data_path_root,
             ratios.append(ratio)
             pd *= ratio
 
-        pd = np.clip(pd, MIN_DEPTH, MAX_DEPTH)
+        pd[pd < min_depth] = min_depth
+        pd[pd > max_depth] = max_depth
 
         errors.append(compute_errors(gd, pd))
+
+    if len(errors) == 0:
+        raise RuntimeError(f"No se pudieron calcular métricas válidas en {data_path_root}")
 
     if not disable_median_scaling and len(ratios) > 0:
         ratios = np.array(ratios)
@@ -361,119 +248,222 @@ def evaluate_one_root(data_path_root,
 
 
 def list_corruption_dirs(root):
+    """
+    Si root ya apunta a una sola corrupción (contiene severity_*), devuelve [root].
+    Si root contiene múltiples corrupciones, devuelve sus subdirectorios.
+    """
     if not os.path.isdir(root):
         return []
-    severities = [d for d in os.listdir(root)
-                  if os.path.isdir(os.path.join(root, d)) and d.startswith("severity_")]
+
+    severities = [
+        d for d in os.listdir(root)
+        if os.path.isdir(os.path.join(root, d)) and d.startswith("severity_")
+    ]
     if len(severities) > 0:
         return [root]
-    return [os.path.join(root, d) for d in sorted(os.listdir(root))
-            if os.path.isdir(os.path.join(root, d))]
+
+    return [
+        os.path.join(root, d)
+        for d in sorted(os.listdir(root))
+        if os.path.isdir(os.path.join(root, d))
+    ]
+
+
+def safe_makedirs(path):
+    os.makedirs(path, exist_ok=True)
+
+
+def save_csv(path, header, rows):
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+        writer.writerows(rows)
 
 
 def main():
-    parser = argparse.ArgumentParser("Evaluate EndoVIS corruptions (16x5) with EndoDAC weights")
-    parser.add_argument("--corruptions_root", type=str, required=True)
-    parser.add_argument("--load_weights_folder", type=str, required=True)
+    parser = argparse.ArgumentParser("Evaluate Hamlyn/EndoVIS corruptions")
+
+    parser.add_argument("--corruptions_root", type=str, required=True,
+                        help="Raíz de corrupciones o carpeta de una corrupción")
+    parser.add_argument("--load_weights_folder", type=str, required=True,
+                        help="Carpeta con encoder.pth y depth.pth")
     parser.add_argument("--splits_dir", type=str, default=os.path.join(os.path.dirname(__file__), "splits"))
-    parser.add_argument("--split", type=str, default="endovis")
+    parser.add_argument("--split", type=str, default="hamlyn",
+                        help="Nombre del split dentro de splits/")
+    parser.add_argument("--dataset", type=str, default="hamlyn",
+                        choices=["hamlyn", "endovis", "scared"],
+                        help="Dataset a usar para construir el loader")
+    parser.add_argument("--data_subdir", type=str, default="",
+                        help="Subcarpeta dentro de severity_X para datasets no-Hamlyn. "
+                             "Para Hamlyn ya no hace falta.")
+
     parser.add_argument("--num_layers", type=int, default=18)
     parser.add_argument("--height", type=int, default=256)
     parser.add_argument("--width", type=int, default=320)
     parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--num_workers", type=int, default=4)
+
     parser.add_argument("--png", action="store_true")
-    parser.add_argument("--eval_stereo", action="store_true")
-    parser.add_argument("--output_csv", type=str, default="corruptions_summary.csv")
     parser.add_argument("--strict", action="store_true")
+    parser.add_argument("--eval_stereo", action="store_true")
+
+    parser.add_argument("--min_depth", type=float, default=1.0)
+    parser.add_argument("--max_depth", type=float, default=50.0)
+
+    parser.add_argument("--run_name", type=str, default="hamlyn_corruptions_eval",
+                        help="Nombre base de la corrida/salida")
+    parser.add_argument("--output_dir", type=str, default="eval_outputs",
+                        help="Directorio donde se guardarán los CSV")
+    parser.add_argument("--summary_filename", type=str, default="summary_by_severity.csv",
+                        help="Nombre del CSV principal")
+    parser.add_argument("--per_corruption_filename", type=str, default="summary_by_corruption.csv",
+                        help="Nombre del CSV con promedio por corrupción")
+    parser.add_argument("--global_avg_filename", type=str, default="global_average.csv",
+                        help="Nombre del CSV con promedio global")
+
     args = parser.parse_args()
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
     cv2.setNumThreads(0)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
     test_files_path = os.path.join(args.splits_dir, args.split, "test_files.txt")
+    gt_path = os.path.join(args.splits_dir, args.split, "gt_depths.npz")
+
     if not os.path.isfile(test_files_path):
-        raise FileNotFoundError(f"No se encontró test_files.txt en {test_files_path}")
+        raise FileNotFoundError(f"No se encontró: {test_files_path}")
+    if not os.path.isfile(gt_path):
+        raise FileNotFoundError(f"No se encontró: {gt_path}")
+
     test_files = readlines(test_files_path)
 
-    gt_path = os.path.join(args.splits_dir, args.split, "gt_depths.npz")
-    if not os.path.isfile(gt_path):
-        raise FileNotFoundError(f"No se encontró gt_depths.npz en {gt_path}")
-    gt_depths = np.load(gt_path, fix_imports=True, encoding='latin1')["data"]
+    gt_npz = np.load(
+        gt_path,
+        allow_pickle=True,
+        fix_imports=True,
+        encoding="latin1"
+    )
+    gt_depths = gt_npz["data"]
+
+    if isinstance(gt_depths, np.ndarray) and gt_depths.dtype == object:
+        gt_depths = list(gt_depths)
+
+    if len(test_files) != len(gt_depths):
+        print(
+            "[WARN] test_files y gt_depths no tienen la misma longitud. "
+            "El script seguirá y filtrará según las muestras realmente utilizables."
+        )
 
     disable_median_scaling = args.eval_stereo
     pred_depth_scale_factor = STEREO_SCALE_FACTOR if args.eval_stereo else 1.0
 
-    print("-> Cargando pesos:", args.load_weights_folder)
+    print("-> Cargando modelo desde:", args.load_weights_folder)
     encoder, depth_decoder = load_model(args.load_weights_folder, args.num_layers, device)
 
     corr_dirs = list_corruption_dirs(args.corruptions_root)
     if len(corr_dirs) == 0:
-        raise FileNotFoundError(f"No se encontraron carpetas de corrupción en {args.corruptions_root}")
+        raise FileNotFoundError(f"No se encontraron corrupciones en {args.corruptions_root}")
+
+    run_output_dir = os.path.join(args.output_dir, args.run_name)
+    safe_makedirs(run_output_dir)
 
     rows = []
-    print("-> Iniciando evaluación de corrupciones")
+
+    print("-> Iniciando evaluación")
     for corr_dir in corr_dirs:
         corr_name = os.path.basename(corr_dir.rstrip("/"))
-        severities = sorted([d for d in os.listdir(corr_dir)
-                             if os.path.isdir(os.path.join(corr_dir, d)) and d.startswith("severity_")],
-                            key=lambda s: int(s.split("_")[-1]) if s.split("_")[-1].isdigit() else 9999)
+
+        severities = sorted(
+            [
+                d for d in os.listdir(corr_dir)
+                if os.path.isdir(os.path.join(corr_dir, d)) and d.startswith("severity_")
+            ],
+            key=lambda s: int(s.split("_")[-1]) if s.split("_")[-1].isdigit() else 9999
+        )
 
         for sev in severities:
-            data_root = os.path.join(corr_dir, sev, "endovis_data")
-            print(f"\n>> {corr_name} / {sev} :: data_path = {data_root}")
+            if args.dataset.lower() == "hamlyn":
+                # Dinámico como evaluate normal:
+                # pasamos la carpeta de severidad, y HamlynDataset resuelve rectifiedXX solo
+                data_root = os.path.join(corr_dir, sev)
+            else:
+                data_root = os.path.join(corr_dir, sev, args.data_subdir) if args.data_subdir else os.path.join(corr_dir, sev)
+
+            print(f"\n>> {corr_name} / {sev} :: {data_root}")
+
             if not os.path.isdir(data_root):
                 print(f"   [WARN] No existe {data_root}, se omite.")
                 continue
 
-            mean_errors = evaluate_one_root(
-                data_path_root=data_root,
-                filenames=test_files,
-                gt_depths=gt_depths,
-                encoder=encoder,
-                depth_decoder=depth_decoder,
-                height=args.height,
-                width=args.width,
-                batch_size=args.batch_size,
-                num_workers=args.num_workers,
-                png=args.png,
-                disable_median_scaling=disable_median_scaling,
-                pred_depth_scale_factor=pred_depth_scale_factor,
-                strict=args.strict,
-                device=device
-            )
+            try:
+                mean_errors = evaluate_one_root(
+                    data_path_root=data_root,
+                    filenames=test_files,
+                    gt_depths=gt_depths,
+                    encoder=encoder,
+                    depth_decoder=depth_decoder,
+                    dataset_name=args.dataset,
+                    height=args.height,
+                    width=args.width,
+                    batch_size=args.batch_size,
+                    png=args.png,
+                    disable_median_scaling=disable_median_scaling,
+                    pred_depth_scale_factor=pred_depth_scale_factor,
+                    strict=args.strict,
+                    min_depth=args.min_depth,
+                    max_depth=args.max_depth,
+                    device=device,
+                )
 
-            abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3 = mean_errors.tolist()
-            rows.append([corr_name, sev, abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3])
+                abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3 = mean_errors.tolist()
+                rows.append([corr_name, sev, abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3])
 
-            print("   Métricas (promedio): "
-                  f"abs_rel={abs_rel:.3f} | sq_rel={sq_rel:.3f} | rmse={rmse:.3f} | "
-                  f"rmse_log={rmse_log:.3f} | a1={a1:.3f} | a2={a2:.3f} | a3={a3:.3f}")
+                print(
+                    f"   abs_rel={abs_rel:.3f} | sq_rel={sq_rel:.3f} | rmse={rmse:.3f} | "
+                    f"rmse_log={rmse_log:.3f} | a1={a1:.3f} | a2={a2:.3f} | a3={a3:.3f}"
+                )
 
-    if rows:
-        header = ["corruption", "severity", "abs_rel", "sq_rel", "rmse", "rmse_log", "a1", "a2", "a3"]
-        with open(args.output_csv, "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(header)
-            w.writerows(rows)
+            except Exception as e:
+                print(f"   [SKIP] {e}")
 
-        print(f"\n-> Resumen guardado en: {args.output_csv}")
+    if not rows:
+        print("\n-> No se generaron resultados.")
+        return
 
-        bucket = defaultdict(list)
-        for r in rows:
-            bucket[r[0]].append(r)
+    header = ["corruption", "severity", "abs_rel", "sq_rel", "rmse", "rmse_log", "a1", "a2", "a3"]
 
-        print("\n======= RESUMEN (por corrupción) =======")
-        for corr in sorted(bucket.keys()):
-            print(f"\n{corr}")
-            print("severity | abs_rel |  sq_rel |  rmse  | rmse_log |   a1   |   a2   |   a3")
-            for _, sev, abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3 in sorted(
-                bucket[corr], key=lambda x: int(x[1].split('_')[-1]) if x[1].split('_')[-1].isdigit() else 9999
-            ):
-                print(f"{sev:>9} | {abs_rel:7.3f} | {sq_rel:7.3f} | {rmse:7.3f} |  {rmse_log:7.3f} | "
-                      f"{a1:6.3f} | {a2:6.3f} | {a3:6.3f}")
-    else:
-        print("\n-> No se generaron filas. Revisa estructura de corrupciones.")
+    summary_csv = os.path.join(run_output_dir, args.summary_filename)
+    save_csv(summary_csv, header, rows)
+
+    print(f"\n-> CSV principal guardado en: {summary_csv}")
+
+    # Promedio por corrupción
+    bucket = defaultdict(list)
+    for r in rows:
+        bucket[r[0]].append(r)
+
+    per_corr_rows = []
+    for corr in sorted(bucket.keys()):
+        vals = np.array([r[2:] for r in bucket[corr]], dtype=np.float64)
+        means = vals.mean(axis=0).tolist()
+        per_corr_rows.append([corr] + means)
+
+    per_corr_header = ["corruption", "abs_rel", "sq_rel", "rmse", "rmse_log", "a1", "a2", "a3"]
+    per_corr_csv = os.path.join(run_output_dir, args.per_corruption_filename)
+    save_csv(per_corr_csv, per_corr_header, per_corr_rows)
+
+    print(f"-> Promedio por corrupción guardado en: {per_corr_csv}")
+
+    # Promedio global
+    all_vals = np.array([r[2:] for r in rows], dtype=np.float64)
+    global_means = all_vals.mean(axis=0).tolist()
+    global_csv = os.path.join(run_output_dir, args.global_avg_filename)
+    save_csv(global_csv, per_corr_header, [["global"] + global_means])
+
+    print(f"-> Promedio global guardado en: {global_csv}")
+
+    print("\n======= RESUMEN =======")
+    print("Archivo principal:", summary_csv)
+    print("Por corrupción   :", per_corr_csv)
+    print("Global           :", global_csv)
 
 
 if __name__ == "__main__":
