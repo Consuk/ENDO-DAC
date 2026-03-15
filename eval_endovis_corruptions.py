@@ -57,7 +57,7 @@ def load_gt_depths_npz(eval_split: str, splits_dir: str, gt_depths_path: str = N
     return gt_depths, gt_path
 
 
-def build_dataset_and_loader(opt):
+def build_dataset(opt):
     dataset_key = getattr(opt, "dataset", None) or opt.eval_split
 
     datasets_dict = {
@@ -87,6 +87,7 @@ def build_dataset_and_loader(opt):
             f"Missing split file: {fpath}\n"
             f"Either create {opt.splits_dir}/{opt.eval_split}/test_files.txt or pass --eval_filelist."
         )
+
     filenames = readlines(fpath)
 
     img_ext = ".jpg" if opt.eval_split == "hamlyn" else ".png"
@@ -107,18 +108,7 @@ def build_dataset_and_loader(opt):
         img_ext=img_ext,
     )
 
-    batch_size = getattr(opt, "eval_batch_size", 16)
-
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=opt.num_workers,
-        pin_memory=True,
-        drop_last=False,
-    )
-
-    return dataset, loader, filenames, fpath
+    return dataset, filenames, fpath
 
 
 def load_model(opt):
@@ -184,38 +174,38 @@ def compute_confidence_intervals(errors):
 
 
 def evaluate_one_root(opt, depther, gt_depths):
-    dataset, dataloader, filenames, eval_filelist_path = build_dataset_and_loader(opt)
+    dataset, filenames, eval_filelist_path = build_dataset(opt)
 
     inference_times = []
     pred_disps_list = []
-    printed_intrinsics_debug = False
+    kept_indices = []
 
     print(f"-> Using eval filelist: {eval_filelist_path}")
     print(f"-> Computing predictions with size {opt.width}x{opt.height}")
 
-    with torch.no_grad():
-        for _, data in tqdm(enumerate(dataloader), total=len(dataloader)):
-            if (not printed_intrinsics_debug) and ("intrinsics_from_file" in data):
-                try:
-                    intr_flag = data["intrinsics_from_file"]
-                    uniq = torch.unique(intr_flag).detach().cpu().tolist()
-                    print(f"[DEBUG] Intrinsics loaded from file? unique flags in batch: {uniq} (1=file, 0=fallback)")
-                    if int(torch.max(intr_flag).item()) == 1:
-                        if (("K", 0) in data):
-                            print(f"[DEBUG] Sample K (first item):\n{data[('K', 0)][0].detach().cpu().numpy()}")
-                    else:
-                        print("[WARNING] Fallback intrinsics in use — check intrinsics.txt path / hamlyn_use_intrinsics_file flags!")
-                except Exception as e:
-                    print(f"[DEBUG] Could not print intrinsics debug info: {e}")
-                printed_intrinsics_debug = True
+    buffer_imgs = []
+    buffer_ids = []
 
-            input_color = data[("color", 0, 0)].cuda()
+    missing = 0
+    debug_shown = 0
+    total = len(filenames)
+
+    def flush_buffer():
+        nonlocal pred_disps_list, inference_times
+
+        if not buffer_imgs:
+            return
+
+        with torch.no_grad():
+            batch = torch.stack(buffer_imgs, dim=0).cuda()
 
             if getattr(opt, "post_process", False):
-                input_color = torch.cat((input_color, torch.flip(input_color, [3])), 0)
+                batch_pp = torch.cat((batch, torch.flip(batch, [3])), 0)
+            else:
+                batch_pp = batch
 
             t0 = time.time()
-            output = depther(input_color)
+            output = depther(batch_pp)
             inference_times.append(time.time() - t0)
 
             if not isinstance(output, dict) or ("disp", 0) not in output:
@@ -223,17 +213,70 @@ def evaluate_one_root(opt, depther, gt_depths):
 
             pred_disp, _ = disp_to_depth(output[("disp", 0)], opt.min_depth, opt.max_depth)
             pred_disp = pred_disp.cpu()[:, 0].numpy()
+
+            if getattr(opt, "post_process", False):
+                pred_disp = pred_disp[:len(buffer_imgs)]
+
             pred_disps_list.append(pred_disp)
+
+    for i in tqdm(range(total), total=total):
+        try:
+            data = dataset[i]
+
+            input_color = data[("color", 0, 0)]
+            if not isinstance(input_color, torch.Tensor):
+                input_color = torch.as_tensor(input_color)
+
+            buffer_imgs.append(input_color)
+            buffer_ids.append(i)
+
+            if len(buffer_imgs) == opt.eval_batch_size:
+                flush_buffer()
+                kept_indices.extend(buffer_ids)
+                buffer_imgs.clear()
+                buffer_ids.clear()
+
+        except FileNotFoundError as e:
+            missing += 1
+            if debug_shown < 10:
+                print(f"[DEBUG] Missing sample idx={i} file='{filenames[i]}' -> {e}")
+                debug_shown += 1
+        except Exception as e:
+            missing += 1
+            if debug_shown < 10:
+                print(f"[DEBUG] Error sample idx={i} file='{filenames[i]}' -> {repr(e)}")
+                debug_shown += 1
+
+    if buffer_imgs:
+        flush_buffer()
+        kept_indices.extend(buffer_ids)
+
+    if len(kept_indices) == 0:
+        raise RuntimeError(
+            f"No usable samples found in {opt.data_path}. "
+            f"Missing/errors: {missing}/{total}"
+        )
+
+    if missing > 0:
+        print(
+            f"-> Using {len(kept_indices)}/{total} samples from split "
+            f"(skipped {missing} missing/error samples)"
+        )
 
     pred_disps = np.concatenate(pred_disps_list, axis=0)
 
-    print(f"-> num_pred: {pred_disps.shape[0]} | num_gt: {len(gt_depths)} | num_split_lines: {len(filenames)}")
-    if pred_disps.shape[0] != len(gt_depths):
+    if len(pred_disps) != len(kept_indices):
         raise AssertionError(
-            f"Mismatch: {pred_disps.shape[0]} predictions vs {len(gt_depths)} gt depth maps.\n"
-            f"Check that the GT .npz was generated from the SAME filelist used here:\n"
-            f"  filelist: {eval_filelist_path}"
+            f"Mismatch after filtering: {len(pred_disps)} predictions vs "
+            f"{len(kept_indices)} kept indices."
         )
+
+    if isinstance(gt_depths, list):
+        gt_depths_sel = [gt_depths[idx] for idx in kept_indices]
+    else:
+        gt_depths_sel = gt_depths[kept_indices]
+
+    print(f"-> num_pred: {pred_disps.shape[0]} | num_gt_filtered: {len(gt_depths_sel)} | num_split_lines: {len(filenames)}")
 
     if opt.eval_stereo:
         print("   Stereo evaluation - disabling median scaling")
@@ -243,8 +286,9 @@ def evaluate_one_root(opt, depther, gt_depths):
 
     errors = []
     ratios = []
+
     for i in range(pred_disps.shape[0]):
-        gt_depth = np.asarray(gt_depths[i], dtype=np.float32)
+        gt_depth = np.asarray(gt_depths_sel[i], dtype=np.float32)
         gt_h, gt_w = gt_depth.shape[:2]
 
         pred_disp = pred_disps[i]
@@ -294,8 +338,9 @@ def evaluate_one_root(opt, depther, gt_depths):
         "confidence_intervals": cls,
         "num_samples": len(errors),
         "avg_inference_ms": float(np.mean(np.array(inference_times)) * 1000) if len(inference_times) > 0 else np.nan,
+        "num_kept": len(kept_indices),
+        "num_missing": missing,
     }
-
 
 def list_corruption_dirs(root):
     if not os.path.isdir(root):
