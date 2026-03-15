@@ -1,41 +1,9 @@
-"""
-Hamlyn Dataset loader (Endo-DAC) with:
-- predefined train/val/test file lists, and
-- monocular self-supervised training support (temporal neighbours + optional stereo token).
-
-Key change vs the previous version:
-This loader can now read **per-sequence intrinsics** from:
-    <data_path>/<sequence_dir>/intrinsics.txt
-
-Example structure (as you described):
-    Hamlyn/
-      rectified01/
-        rectified01/
-          intrinsics.txt
-          image01/0000000001.jpg
-          image02/0000000001.jpg
-          depth01/0000000001.png
-          depth02/0000000001.png
-
-The intrinsics are converted into the (K, inv_K) pyramid expected by the training code.
-K is produced in pixel units for each pyramid scale, consistent with how Monodepth-style
-pipelines use K in backproject/project layers.
-
-Notes:
-- If intrinsics.txt cannot be parsed / is missing, we fall back to a reasonable
-  "dummy" normalized K (fx=fy=0.5, cx=cy=0.5). This keeps runs from crashing, but
-  for Hamlyn you should ensure intrinsics.txt exists per sequence.
-- When random horizontal flip is enabled, we also flip the principal point:
-      cx' = (W - 1) - cx
-  at the corresponding scale. This matters when using real intrinsics.
-"""
-
 from __future__ import absolute_import, division, print_function
 
 import os
 import random
 import re
-from typing import Dict, Optional, Tuple
+from typing import Dict, Tuple
 
 import numpy as np
 from PIL import Image, ImageFile
@@ -66,6 +34,11 @@ class HamlynDataset(data.Dataset):
       - folder: e.g. rectified01  (or sometimes rectified01/rectified01 in some splits)
       - frame_index: integer index (Hamlyn typically uses 10-digit zero padded filenames)
       - side: 'l' or 'r'
+
+    Main fix:
+      - exact frame matching by default
+      - side-aware frame indexing (image01 / image02 tracked independently)
+      - optional nearest-neighbor fallback remains available if ever needed
     """
 
     def __init__(
@@ -80,6 +53,9 @@ class HamlynDataset(data.Dataset):
         img_ext: str = ".jpg",
         use_intrinsics_file: bool = True,
         intrinsics_filename: str = "intrinsics.txt",
+        exact_match: bool = True,
+        allow_nearest_when_missing: bool = True,
+        debug_missing_limit: int = 20,
     ):
         super().__init__()
 
@@ -95,6 +71,11 @@ class HamlynDataset(data.Dataset):
 
         self.use_intrinsics_file = bool(use_intrinsics_file)
         self.intrinsics_filename = str(intrinsics_filename)
+
+        self.exact_match = bool(exact_match)
+        self.allow_nearest_when_missing = bool(allow_nearest_when_missing)
+        self.debug_missing_limit = int(debug_missing_limit)
+        self._missing_debug_count = 0
 
         self.loader = pil_loader
         self.to_tensor = transforms.ToTensor()
@@ -123,7 +104,7 @@ class HamlynDataset(data.Dataset):
                 (self.height // s, self.width // s), interpolation=self.interp
             )
 
-        # Fallback "dummy" normalized intrinsics (only used if intrinsics file is missing/broken)
+        # Fallback "dummy" normalized intrinsics
         self.K_fallback_norm = np.array(
             [[0.5, 0.0, 0.5],
              [0.0, 0.5, 0.5],
@@ -131,10 +112,14 @@ class HamlynDataset(data.Dataset):
             dtype=np.float32,
         )
 
-        # Map each folder name from split -> actual folder containing image01
-        self.index_map: Dict[str, Dict[int, str]] = {}
-        self.sorted_indices: Dict[str, list] = {}
+        # Map each folder token from split -> actual on-disk folder
         self.actual_folder_map: Dict[str, str] = {}
+
+        # Side-aware filename maps:
+        # self.index_map[folder]["l"][idx] -> filename in image01
+        # self.index_map[folder]["r"][idx] -> filename in image02
+        self.index_map: Dict[str, Dict[str, Dict[int, str]]] = {}
+        self.sorted_indices: Dict[str, Dict[str, list]] = {}
 
         unique_folders = set()
         for line in self.filenames:
@@ -145,28 +130,49 @@ class HamlynDataset(data.Dataset):
         for folder in unique_folders:
             candidate_paths = [folder, os.path.join(folder, folder)]
             actual_folder = None
-            index_dict: Dict[int, str] = {}
+
+            side_maps = {
+                "l": {},
+                "r": {},
+            }
 
             for cand in candidate_paths:
-                folder_path = os.path.join(self.data_path, cand, "image01")
-                if os.path.isdir(folder_path):
+                left_path = os.path.join(self.data_path, cand, "image01")
+                right_path = os.path.join(self.data_path, cand, "image02")
+
+                if os.path.isdir(left_path) or os.path.isdir(right_path):
                     actual_folder = cand
-                    for fname in os.listdir(folder_path):
-                        if fname.lower().endswith(tuple(self._allowed_img_exts)):
-                            stem = os.path.splitext(fname)[0]
-                            try:
-                                idx = int(stem)
-                            except ValueError:
-                                continue
-                            index_dict[idx] = fname
+
+                    if os.path.isdir(left_path):
+                        for fname in os.listdir(left_path):
+                            if fname.lower().endswith(tuple(self._allowed_img_exts)):
+                                stem = os.path.splitext(fname)[0]
+                                try:
+                                    idx = int(stem)
+                                except ValueError:
+                                    continue
+                                side_maps["l"][idx] = fname
+
+                    if os.path.isdir(right_path):
+                        for fname in os.listdir(right_path):
+                            if fname.lower().endswith(tuple(self._allowed_img_exts)):
+                                stem = os.path.splitext(fname)[0]
+                                try:
+                                    idx = int(stem)
+                                except ValueError:
+                                    continue
+                                side_maps["r"][idx] = fname
                     break
 
             if actual_folder is None:
                 actual_folder = folder
 
             self.actual_folder_map[folder] = actual_folder
-            self.index_map[folder] = index_dict
-            self.sorted_indices[folder] = sorted(index_dict.keys())
+            self.index_map[folder] = side_maps
+            self.sorted_indices[folder] = {
+                "l": sorted(side_maps["l"].keys()),
+                "r": sorted(side_maps["r"].keys()),
+            }
 
         # Intrinsics cache: folder -> {"l": K_3x3, "r": K_3x3}
         self._intrinsics_cache: Dict[str, Dict[str, np.ndarray]] = {}
@@ -181,7 +187,6 @@ class HamlynDataset(data.Dataset):
 
     def preprocess(self, inputs: dict, color_aug) -> None:
         """Resize and augment colour images for each scale (in-place)."""
-        # First resize raw images to each scale
         for k in list(inputs.keys()):
             if "color" in k:
                 _, frame_id, scale_id = k
@@ -189,7 +194,6 @@ class HamlynDataset(data.Dataset):
                     for i in range(self.num_scales):
                         inputs[("color", frame_id, i)] = self.resize[i](inputs[k])
 
-        # Then convert to tensors and apply colour augmentation
         for k in list(inputs.keys()):
             if "color" in k:
                 _, frame_id, scale_id = k
@@ -199,38 +203,63 @@ class HamlynDataset(data.Dataset):
 
     # -------------------------- helpers --------------------------
 
-    def get_nearest_index(self, folder: str, target_idx: int) -> int:
-        """Return the nearest available frame index for a given folder."""
-        mapping = self.index_map.get(folder, {})
+    def get_nearest_index(self, folder: str, target_idx: int, side: str) -> int:
+        """Return the nearest available frame index for a given folder and side."""
+        mapping = self.index_map.get(folder, {}).get(side, {})
         if not mapping:
             return target_idx
         if target_idx in mapping:
             return target_idx
-        candidates = self.sorted_indices.get(folder, [])
+        candidates = self.sorted_indices.get(folder, {}).get(side, [])
         if not candidates:
             return target_idx
         return min(candidates, key=lambda k: abs(k - target_idx))
 
+    def _candidate_filenames_exact(self, frame_index: int) -> list:
+        stem = f"{frame_index:010d}"
+        return [
+            stem + self.img_ext,
+            stem + ".jpg",
+            stem + ".jpeg",
+            stem + ".png",
+        ]
+
+    def _resolve_filename(self, folder: str, frame_index: int, side: str) -> str:
+        """
+        Resolve the filename for a requested frame.
+
+        By default:
+          - exact match is required
+        Optional fallback:
+          - nearest frame on the same side only
+        """
+        actual_folder = self.actual_folder_map.get(folder, folder)
+        side_dir = "image01" if side == "l" else "image02"
+
+        # 1) Exact match first
+        for fname in self._candidate_filenames_exact(frame_index):
+            img_path = os.path.join(self.data_path, actual_folder, side_dir, fname)
+            if os.path.isfile(img_path):
+                return fname
+
+        # 2) Optional nearest fallback
+        if self.allow_nearest_when_missing:
+            idx = self.get_nearest_index(folder, frame_index, side)
+            fname = self.index_map.get(folder, {}).get(side, {}).get(idx)
+            if fname is not None:
+                return fname
+
+        raise FileNotFoundError(
+            f"Could not resolve exact frame for folder={folder}, side={side}, "
+            f"frame_index={frame_index} under {os.path.join(self.data_path, actual_folder, side_dir)}"
+        )
+
     def get_color(self, folder: str, frame_index: int, side: str, do_flip: bool) -> Image.Image:
         """Load a colour image from disk."""
         side_dir = "image01" if side == "l" else "image02"
-        idx = self.get_nearest_index(folder, frame_index)
-        fname = self.index_map.get(folder, {}).get(idx)
-        if fname is None:
-            # Hamlyn commonly uses 10-digit zero padding
-            fname = f"{frame_index:010d}{self.img_ext}"
-
         actual_folder = self.actual_folder_map.get(folder, folder)
+        fname = self._resolve_filename(folder, frame_index, side)
         img_path = os.path.join(self.data_path, actual_folder, side_dir, fname)
-
-        # If the chosen extension does not exist, try common alternatives
-        if not os.path.isfile(img_path):
-            stem = os.path.splitext(fname)[0]
-            for ext in (".jpg", ".jpeg", ".png"):
-                alt = os.path.join(self.data_path, actual_folder, side_dir, stem + ext)
-                if os.path.isfile(alt):
-                    img_path = alt
-                    break
 
         img = self.loader(img_path)
         if do_flip:
@@ -240,15 +269,12 @@ class HamlynDataset(data.Dataset):
     def get_depth(self, folder: str, frame_index: int, side: str, do_flip: bool) -> np.ndarray:
         """Load a depth map from disk (used only if self.load_depth is enabled)."""
         depth_dir = "depth01" if side == "l" else "depth02"
-        idx = self.get_nearest_index(folder, frame_index)
-        fname = self.index_map.get(folder, {}).get(idx)
-        if fname is None:
-            fname = f"{frame_index:010d}{self.img_ext}"
-        base = os.path.splitext(fname)[0]
-        depth_fname = base + ".png"
-
         actual_folder = self.actual_folder_map.get(folder, folder)
+
+        base = os.path.splitext(self._resolve_filename(folder, frame_index, side))[0]
+        depth_fname = base + ".png"
         depth_path = os.path.join(self.data_path, actual_folder, depth_dir, depth_fname)
+
         depth = np.array(Image.open(depth_path))
         if do_flip:
             depth = np.fliplr(depth)
@@ -260,7 +286,6 @@ class HamlynDataset(data.Dataset):
 
     @staticmethod
     def _numbers_from_text(text: str) -> list:
-        # Supports ints + floats, optional signs.
         return [float(x) for x in re.findall(r"[-+]?\d*\.\d+|[-+]?\d+", text)]
 
     @staticmethod
@@ -303,9 +328,6 @@ class HamlynDataset(data.Dataset):
                 txt = f.read()
             nums = self._numbers_from_text(txt)
 
-            # Support 1 or 2 matrices in the file
-            #  - 1 matrix: 4 / 9 / 12 / 16 numbers
-            #  - 2 matrices: 8 / 18 / 24 / 32 numbers (left then right)
             if len(nums) in (4, 9, 12, 16):
                 K = self._k_from_flat(nums)
                 Ks = {"l": K, "r": K}
@@ -318,17 +340,13 @@ class HamlynDataset(data.Dataset):
                 raise ValueError(
                     f"Unexpected number of values in {intr_path}: {len(nums)}"
                 )
-        except Exception as e:
-            # Keep fallback, but don't crash training
-            # (If you want strict behaviour, change this to 'raise')
+        except Exception:
             Ks = {"l": self.K_fallback_norm.copy(), "r": self.K_fallback_norm.copy()}
 
-        # Ensure dtype/shape
         for s in ("l", "r"):
             K = Ks[s].astype(np.float32)
             if K.shape != (3, 3):
                 K = K.reshape(3, 3).astype(np.float32)
-            # enforce standard form
             K[2, :] = np.array([0.0, 0.0, 1.0], dtype=np.float32)
             Ks[s] = K
 
@@ -339,19 +357,20 @@ class HamlynDataset(data.Dataset):
     def _to_normalized_K(K: np.ndarray, orig_w: int, orig_h: int) -> np.ndarray:
         """
         Convert K to a normalized K (relative to original image size), if needed.
-
-        Heuristic:
-          - If focal/principal values are larger than ~5, assume pixel units -> normalize.
-          - Otherwise assume already normalized.
         """
         K = K.astype(np.float32).copy()
-        v = max(abs(float(K[0, 0])), abs(float(K[1, 1])), abs(float(K[0, 2])), abs(float(K[1, 2])))
+        v = max(
+            abs(float(K[0, 0])),
+            abs(float(K[1, 1])),
+            abs(float(K[0, 2])),
+            abs(float(K[1, 2])),
+        )
         if v > 5.0:
             K[0, 0] /= float(orig_w)
             K[0, 2] /= float(orig_w)
             K[1, 1] /= float(orig_h)
             K[1, 2] /= float(orig_h)
-        # Make sure bottom row is [0,0,1]
+
         K[2, :] = np.array([0.0, 0.0, 1.0], dtype=np.float32)
         return K
 
@@ -372,9 +391,7 @@ class HamlynDataset(data.Dataset):
         Ks_file = self._load_intrinsics_for_folder(folder)
         K_raw = Ks_file.get(side, self.K_fallback_norm)
 
-        # Determine if we really used file intrinsics or fell back
         used_file = int(self.use_intrinsics_file and not np.allclose(K_raw, self.K_fallback_norm))
-
         K_norm = self._to_normalized_K(K_raw, orig_w, orig_h)
 
         Ks: Dict[int, np.ndarray] = {}
@@ -389,15 +406,11 @@ class HamlynDataset(data.Dataset):
             K[1, :] *= float(h_s)
 
             if do_flip:
-                # Horizontal flip about the image center
                 K[0, 2] = float(w_s - 1) - float(K[0, 2])
 
-            # Endo-DAC Project3D expects 4x4 K and 4x4 inv_K (Monodepth-style).
-            # We therefore embed the 3x3 intrinsics into a 4x4 matrix.
             K4 = np.eye(4, dtype=np.float32)
             K4[:3, :3] = K.astype(np.float32)
 
-            # Use pinv for numerical stability
             inv_K4 = np.linalg.pinv(K4)
 
             Ks[scale] = K4.astype(np.float32)
@@ -421,7 +434,6 @@ class HamlynDataset(data.Dataset):
         if side not in ("l", "r"):
             side = "l"
 
-        # sequence id from folder digits (last two digits)
         seq_digits = "".join([c for c in folder if c.isdigit()])
         if len(seq_digits) >= 2:
             sequence = int(seq_digits[-2:])
@@ -446,21 +458,17 @@ class HamlynDataset(data.Dataset):
                 img = self.get_color(folder, frame_index + i, side, do_flip)
                 inputs[("color", i, -1)] = img
 
-        # Determine original size from the reference image (after flip size is unchanged)
         ref_img: Image.Image = inputs[("color", 0, -1)]
-        orig_w, orig_h = ref_img.size  # PIL uses (W,H)
+        orig_w, orig_h = ref_img.size
 
-        # Build K pyramid (per-sequence intrinsics when available)
         Ks, invKs, used_file = self._make_K_pyramid(folder, side, orig_w, orig_h, do_flip)
 
         for scale in range(self.num_scales):
             inputs[("K", scale)] = torch.from_numpy(Ks[scale]).float()
             inputs[("inv_K", scale)] = torch.from_numpy(invKs[scale]).float()
 
-        # For W&B / debugging
         inputs["intrinsics_from_file"] = torch.tensor(used_file, dtype=torch.int64)
 
-        # Apply same color augmentation to all images
         if do_color_aug:
             color_aug = transforms.ColorJitter(
                 self.brightness, self.contrast, self.saturation, self.hue
@@ -468,25 +476,21 @@ class HamlynDataset(data.Dataset):
         else:
             color_aug = lambda x: x
 
-        # Resize + to_tensor + aug
         self.preprocess(inputs, color_aug)
 
-        # Remove raw images
         for i in self.frame_idxs:
             inputs.pop(("color", i, -1))
             inputs.pop(("color_aug", i, -1))
 
-        # Optional depth (disabled by default)
         if self.load_depth and not self.is_train:
             depth = self.get_depth(folder, frame_index, side, do_flip)
             inputs["depth_gt"] = torch.from_numpy(np.expand_dims(depth, 0).astype(np.float32))
 
-        # Optional stereo baseline transform (not used for pure monocular runs)
         if "s" in self.frame_idxs:
             stereo_T = np.eye(4, dtype=np.float32)
             baseline_sign = -1 if do_flip else 1
             side_sign = -1 if side == "l" else 1
-            stereo_T[0, 3] = side_sign * baseline_sign * 0.1  # nominal baseline
+            stereo_T[0, 3] = side_sign * baseline_sign * 0.1
             inputs["stereo_T"] = torch.from_numpy(stereo_T)
 
         return inputs
