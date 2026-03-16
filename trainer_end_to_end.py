@@ -643,6 +643,9 @@ class Trainer:
             pred_depth[pred_depth < MIN_DEPTH] = MIN_DEPTH
             pred_depth[pred_depth > MAX_DEPTH] = MAX_DEPTH
 
+            gt_depth = np.asarray(gt_depth, dtype=np.float32)
+            pred_depth = np.asarray(pred_depth, dtype=np.float32)
+
             errors.append(compute_errors(gt_depth, pred_depth))
 
         if not self.opt.disable_median_scaling:
