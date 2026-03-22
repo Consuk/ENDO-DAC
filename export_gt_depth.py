@@ -2,17 +2,102 @@ from __future__ import absolute_import, division, print_function
 
 import os
 import argparse
+import re
 import numpy as np
 import PIL.Image as pil
 import cv2
 
-from utils.utils import readlines
-from datasets.c3vd_dataset import (
-    DEFAULT_C3VD_DEPTH_SCALE,
-    build_c3vd_default_filelists,
-    resolve_c3vd_depth_path,
-)
 # from kitti_utils import generate_depth_map
+
+DEFAULT_C3VD_DEPTH_SCALE = 100.0 / 65535.0
+
+
+def readlines(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return [line.rstrip("\n") for line in f]
+
+
+def _safe_listdir(path):
+    if not os.path.isdir(path):
+        return []
+    try:
+        return os.listdir(path)
+    except Exception:
+        return []
+
+
+def _parse_depth_index(name):
+    m = re.match(r"^(\d+)_depth\.(tiff|tif|png|jpg|jpeg)$", name, flags=re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+    m = re.match(r"^(\d+)\.(tiff|tif|png|jpg|jpeg)$", name, flags=re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def _collect_depth_map(folder):
+    mapping = {}
+    for n in _safe_listdir(folder):
+        idx = _parse_depth_index(n)
+        if idx is not None:
+            mapping[idx] = n
+    return mapping
+
+
+def _resolve_c3vd_folder_rel(data_path, folder_token):
+    token = folder_token.strip().strip("/\\")
+    candidates = [
+        token,
+        os.path.join("training", token),
+        os.path.join("validation", token),
+        os.path.join("testing", token),
+    ]
+    for rel in candidates:
+        if os.path.isdir(os.path.join(data_path, rel)):
+            return rel.replace("\\", "/")
+    return token.replace("\\", "/")
+
+
+def resolve_c3vd_depth_path(data_path, folder_token, frame_index, folder_cache=None):
+    cache = folder_cache if folder_cache is not None else {}
+    token = folder_token.strip()
+
+    if token not in cache:
+        folder_rel = _resolve_c3vd_folder_rel(data_path, token)
+        seq_abs = os.path.join(data_path, folder_rel)
+
+        candidate_roots = [seq_abs, os.path.join(seq_abs, "depth")]
+        best_root = seq_abs
+        best_map = {}
+        for root in candidate_roots:
+            dmap = _collect_depth_map(root)
+            if len(dmap) > len(best_map):
+                best_map = dmap
+                best_root = root
+
+        cache[token] = {
+            "folder_rel": folder_rel,
+            "depth_root": best_root,
+            "depth_map": best_map,
+        }
+
+    info = cache[token]
+    depth_name = info["depth_map"].get(frame_index)
+    if depth_name is None:
+        raise FileNotFoundError(
+            f"Missing C3VD depth frame {frame_index} for '{folder_token}' "
+            f"(resolved folder: {info['folder_rel']})"
+        )
+    return os.path.join(info["depth_root"], depth_name)
+
+
+def build_c3vd_default_filelists(data_path, write_to_splits_dir=None):
+    # Reuse the standalone split generator script (torch-free).
+    from generate_c3vd_splits import generate_splits
+
+    filelists = generate_splits(data_path, write_to_splits_dir or os.path.join(os.path.dirname(__file__), "splits", "c3vd"))
+    return filelists
 
 
 def export_gt_depths_kitti():
