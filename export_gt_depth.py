@@ -7,6 +7,11 @@ import PIL.Image as pil
 import cv2
 
 from utils.utils import readlines
+from datasets.c3vd_dataset import (
+    DEFAULT_C3VD_DEPTH_SCALE,
+    build_c3vd_default_filelists,
+    resolve_c3vd_depth_path,
+)
 # from kitti_utils import generate_depth_map
 
 
@@ -22,7 +27,7 @@ def export_gt_depths_kitti():
                         type=str,
                         help='which split to export gt from',
                         required=True,
-                        choices=["eigen", "eigen_benchmark", "endovis", "hamlyn"])
+                        choices=["eigen", "eigen_benchmark", "endovis", "hamlyn", "c3vd"])
     parser.add_argument('--useage',
                         type=str,
                         help='gt depth use for evaluation or 3d reconstruction',
@@ -46,6 +51,10 @@ def export_gt_depths_kitti():
                         type=int,
                         default=-1,
                         help='Offset to apply to Hamlyn frame_id when reading depth files (default: -1 for 1-based split files).')
+    parser.add_argument('--c3vd_depth_scale',
+                        type=float,
+                        default=DEFAULT_C3VD_DEPTH_SCALE,
+                        help='Scale factor to decode C3VD uint16 depth maps (default: 100/65535).')
     opt = parser.parse_args()
 
     # Decide which file list to use and where to save the output
@@ -70,8 +79,26 @@ def export_gt_depths_kitti():
     if opt.output_path:
         output_path = os.path.expanduser(opt.output_path)
 
-    # Read the list of files
-    lines = readlines(split_file)
+    # Read the list of files. For C3VD we can auto-generate from data_path when split files are absent.
+    if os.path.exists(split_file):
+        lines = readlines(split_file)
+    elif opt.split == "c3vd" and not opt.split_file_path:
+        auto_lists = build_c3vd_default_filelists(
+            opt.data_path,
+            write_to_splits_dir=os.path.join(os.path.dirname(__file__), "splits", opt.split),
+        )
+        if opt.useage == "eval":
+            lines = auto_lists["test"]
+        else:
+            # C3VD has no dedicated 3d_reconstruction split in this repo;
+            # use testing lines by default for reconstruction export too.
+            lines = auto_lists["test"]
+        split_file = "<auto:c3vd>"
+    else:
+        raise FileNotFoundError(
+            f"Split file not found: {split_file}. "
+            "Pass --split_file_path or create the split file."
+        )
 
     # If a custom split file is provided, remember its directory for fallback searches
     split_base_data_path = None
@@ -80,6 +107,7 @@ def export_gt_depths_kitti():
 
     print("Exporting ground truth depths for {}".format(opt.split))
     gt_depths = []
+    c3vd_folder_cache = {}
 
     for i, line in enumerate(lines):
         # Each line can have 2 or 3 entries: <folder> <frame_index> [<side>]
@@ -202,6 +230,20 @@ def export_gt_depths_kitti():
             # If multi-channel, keep first channel BORRAR LUEGO
             if gt_depth.ndim == 3:
                 gt_depth = gt_depth[:, :, 0]
+
+        elif opt.split == "c3vd":
+            depth_path = resolve_c3vd_depth_path(
+                opt.data_path,
+                folder,
+                frame_id,
+                folder_cache=c3vd_folder_cache,
+            )
+            gt_depth = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
+            if gt_depth is None:
+                raise RuntimeError(f"cv2.imread failed for {depth_path}")
+            if gt_depth.ndim == 3:
+                gt_depth = gt_depth[:, :, 0]
+            gt_depth = gt_depth.astype(np.float32) * float(opt.c3vd_depth_scale)
 
         else:
             raise ValueError(f"Unknown split {opt.split}")

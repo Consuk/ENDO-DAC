@@ -16,7 +16,11 @@ import wandb
 import datasets
 # Explicitly import Hamlyn and C3VD dataset classes so they can be used below
 from datasets.hamlyn_dataset import HamlynDataset  # type: ignore
-from datasets.c3vd_dataset import C3VDDataset  # type: ignore
+from datasets.c3vd_dataset import (  # type: ignore
+    C3VDDataset,
+    DEFAULT_C3VD_DEPTH_SCALE,
+    build_c3vd_default_filelists,
+)
 import models.encoders as encoders
 import models.decoders as decoders
 import models.endodac as endodac
@@ -228,17 +232,45 @@ class Trainer:
         # Default to SCAREDRAWDataset if an unknown dataset is specified
         self.dataset = datasets_dict.get(self.opt.dataset, datasets.SCAREDRAWDataset)
 
-        fpath = os.path.join(
-            os.path.dirname(__file__), "splits", self.opt.split, "{}_files.txt"
-        )
-        train_filenames = readlines(fpath.format("train"))
-        # Use validation list if it exists; otherwise reuse test list for validation
+        split_dir = os.path.join(os.path.dirname(__file__), "splits", self.opt.split)
+        fpath = os.path.join(split_dir, "{}_files.txt")
+        train_file = fpath.format("train")
         val_file = fpath.format("val")
-        if os.path.exists(val_file):
-            val_filenames = readlines(val_file)
+        test_file = fpath.format("test")
+
+        if (
+            self.opt.dataset == "c3vd"
+            and (not os.path.exists(train_file) or not os.path.exists(test_file))
+        ):
+            print(
+                f"[INFO] Missing split files for C3VD under '{split_dir}'. "
+                "Auto-generating filelists from data_path..."
+            )
+            auto_lists = build_c3vd_default_filelists(
+                self.opt.data_path, write_to_splits_dir=split_dir
+            )
+            train_filenames = auto_lists["train"]
+            val_filenames = auto_lists["val"]
+            test_filenames = auto_lists["test"]
         else:
-            val_filenames = readlines(fpath.format("test"))
-        test_filenames = readlines(fpath.format("test"))
+            train_filenames = readlines(train_file)
+            # Use validation list if it exists; otherwise reuse test list for validation
+            if os.path.exists(val_file):
+                val_filenames = readlines(val_file)
+            else:
+                val_filenames = readlines(test_file)
+            test_filenames = readlines(test_file)
+
+        if len(train_filenames) == 0:
+            raise RuntimeError(
+                f"No training samples found for split '{self.opt.split}'. "
+                f"Check data_path='{self.opt.data_path}' and split files under '{split_dir}'."
+            )
+        if len(test_filenames) == 0:
+            raise RuntimeError(
+                f"No testing samples found for split '{self.opt.split}'. "
+                f"Check data_path='{self.opt.data_path}' and split files under '{split_dir}'."
+            )
 
         # Image extension depending on split
         if self.opt.split == "hamlyn":
@@ -251,30 +283,39 @@ class Trainer:
             num_train_samples // self.opt.batch_size * self.opt.num_epochs
         )
 
+        common_dataset_kwargs = {"img_ext": img_ext}
         if self.opt.dataset == "hamlyn":
-            train_dataset = self.dataset(
-                self.opt.data_path,
-                train_filenames,
-                self.opt.height,
-                self.opt.width,
-                self.opt.frame_ids,
-                4,
-                is_train=True,
-                img_ext=img_ext,
-                use_intrinsics_file=(not self.opt.learn_intrinsics) and getattr(self.opt, "hamlyn_use_intrinsics_file", True),
-                intrinsics_filename=getattr(self.opt, "hamlyn_intrinsics_filename", "intrinsics.txt"),
+            common_dataset_kwargs.update(
+                {
+                    "use_intrinsics_file": (not self.opt.learn_intrinsics)
+                    and getattr(self.opt, "hamlyn_use_intrinsics_file", True),
+                    "intrinsics_filename": getattr(
+                        self.opt, "hamlyn_intrinsics_filename", "intrinsics.txt"
+                    ),
+                }
             )
-        else:
-            train_dataset = self.dataset(
-                self.opt.data_path,
-                train_filenames,
-                self.opt.height,
-                self.opt.width,
-                self.opt.frame_ids,
-                4,
-                is_train=True,
-                img_ext=img_ext,
+        elif self.opt.dataset == "c3vd":
+            common_dataset_kwargs.update(
+                {
+                    "use_intrinsics_file": (not self.opt.learn_intrinsics)
+                    and getattr(self.opt, "c3vd_use_intrinsics_file", True),
+                    "intrinsics_path": getattr(self.opt, "c3vd_intrinsics_path", None),
+                    "depth_scale": getattr(
+                        self.opt, "c3vd_depth_scale", DEFAULT_C3VD_DEPTH_SCALE
+                    ),
+                }
             )
+
+        train_dataset = self.dataset(
+            self.opt.data_path,
+            train_filenames,
+            self.opt.height,
+            self.opt.width,
+            self.opt.frame_ids,
+            4,
+            is_train=True,
+            **common_dataset_kwargs,
+        )
         self.train_loader = DataLoader(
             train_dataset,
             self.opt.batch_size,
@@ -283,30 +324,16 @@ class Trainer:
             pin_memory=True,
             drop_last=True,
         )
-        if self.opt.dataset == "hamlyn":
-            val_dataset = self.dataset(
-                self.opt.data_path,
-                val_filenames,
-                self.opt.height,
-                self.opt.width,
-                self.opt.frame_ids,
-                4,
-                is_train=False,
-                img_ext=img_ext,
-                use_intrinsics_file=(not self.opt.learn_intrinsics) and getattr(self.opt, "hamlyn_use_intrinsics_file", True),
-                intrinsics_filename=getattr(self.opt, "hamlyn_intrinsics_filename", "intrinsics.txt"),
-            )
-        else:
-            val_dataset = self.dataset(
-                self.opt.data_path,
-                val_filenames,
-                self.opt.height,
-                self.opt.width,
-                self.opt.frame_ids,
-                4,
-                is_train=False,
-                img_ext=img_ext,
-            )
+        val_dataset = self.dataset(
+            self.opt.data_path,
+            val_filenames,
+            self.opt.height,
+            self.opt.width,
+            self.opt.frame_ids,
+            4,
+            is_train=False,
+            **common_dataset_kwargs,
+        )
         self.val_loader = DataLoader(
             val_dataset,
             self.opt.batch_size,
@@ -315,30 +342,16 @@ class Trainer:
             pin_memory=True,
             drop_last=True,
         )
-        if self.opt.dataset == "hamlyn":
-            test_dataset = self.dataset(
-                self.opt.data_path,
-                test_filenames,
-                self.opt.height,
-                self.opt.width,
-                self.opt.frame_ids,
-                4,
-                is_train=False,
-                img_ext=img_ext,
-                use_intrinsics_file=(not self.opt.learn_intrinsics) and getattr(self.opt, "hamlyn_use_intrinsics_file", True),
-                intrinsics_filename=getattr(self.opt, "hamlyn_intrinsics_filename", "intrinsics.txt"),
-            )
-        else:
-            test_dataset = self.dataset(
-                self.opt.data_path,
-                test_filenames,
-                self.opt.height,
-                self.opt.width,
-                self.opt.frame_ids,
-                4,
-                is_train=False,
-                img_ext=img_ext,
-            )
+        test_dataset = self.dataset(
+            self.opt.data_path,
+            test_filenames,
+            self.opt.height,
+            self.opt.width,
+            self.opt.frame_ids,
+            4,
+            is_train=False,
+            **common_dataset_kwargs,
+        )
         self.test_loader = DataLoader(
             test_dataset,
             1,
@@ -422,14 +435,21 @@ class Trainer:
             "da/a3",
         ]
 
-        # ---------- Load gt_depths (Hamlyn / EndoVis) ----------
+        # ---------- Load gt_depths (optional during training eval) ----------
         gt_path = os.path.join(splits_dir, self.opt.eval_split, "gt_depths.npz")
-        self.gt_depths = np.load(
-            gt_path,
-            fix_imports=True,
-            encoding="latin1",
-            allow_pickle=True,
-        )["data"]
+        self.gt_depths = None
+        if os.path.exists(gt_path):
+            self.gt_depths = np.load(
+                gt_path,
+                fix_imports=True,
+                encoding="latin1",
+                allow_pickle=True,
+            )["data"]
+        else:
+            print(
+                f"[WARNING] GT depths not found at '{gt_path}'. "
+                "Epoch-level depth evaluation will be skipped."
+            )
 
         print("Using split:\n  ", self.opt.split)
         print(
@@ -545,16 +565,18 @@ class Trainer:
         self.epoch = 0
         self.step = 0
         self.start_time = time.time()
+        best_rmse = None
         for self.epoch in range(self.opt.num_epochs):
             self.run_epoch()
-            if self.epoch == 0:
-                rmse, a1 = self.run_epoch_eval()
-                self.save_model(mode="epoch")
-            else:
-                rmse_new, a1_new = self.run_epoch_eval()
-                if rmse_new < rmse:
-                    rmse = rmse_new
+
+            if self.gt_depths is not None and len(self.gt_depths) > 0:
+                rmse_new, _ = self.run_epoch_eval()
+                if best_rmse is None or rmse_new < best_rmse:
+                    best_rmse = rmse_new
                     self.save_model(mode="epoch")
+            else:
+                # No GT depth file available for this split, keep periodic checkpointing.
+                self.save_model(mode="epoch")
             self.save_model(mode="last")
 
     def run_epoch(self):
@@ -593,6 +615,12 @@ class Trainer:
 
     def run_epoch_eval(self):
         """Run a single epoch of evaluation."""
+        if self.gt_depths is None or len(self.gt_depths) == 0:
+            raise RuntimeError(
+                "run_epoch_eval called without ground-truth depths. "
+                "Generate splits/<eval_split>/gt_depths.npz first."
+            )
+
         print("Evaluating")
         MIN_DEPTH = 1e-3
         MAX_DEPTH = 150
@@ -623,6 +651,8 @@ class Trainer:
         n = min(pred_depths.shape[0], len(self.gt_depths))
         if pred_depths.shape[0] != n:
             print(f"Warning: {pred_depths.shape[0]} predictions but only {len(self.gt_depths)} ground-truth depths; evaluating first {n}")
+        if n == 0:
+            raise RuntimeError("No overlapping predictions/ground-truth samples for evaluation.")
         for i in range(n):
             gt_depth = self.gt_depths[i]
             gt_height, gt_width = gt_depth.shape[:2]

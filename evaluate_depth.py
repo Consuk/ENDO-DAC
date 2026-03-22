@@ -18,9 +18,15 @@ from options import MonodepthOptions
 import datasets
 from datasets.hamlyn_dataset import HamlynDataset  # trainer-style explicit import
 try:
-    from datasets.c3vd_dataset import C3VDDataset
+    from datasets.c3vd_dataset import (
+        C3VDDataset,
+        DEFAULT_C3VD_DEPTH_SCALE,
+        build_c3vd_default_filelists,
+    )
 except Exception:
     C3VDDataset = None
+    DEFAULT_C3VD_DEPTH_SCALE = 100.0 / 65535.0
+    build_c3vd_default_filelists = None
 
 from datasets.scared_dataset import SCAREDRAWDataset
 
@@ -69,6 +75,8 @@ def build_dataset_and_loader(opt):
     """
     # Choose dataset key similar to trainer:
     dataset_key = getattr(opt, "dataset", None) or opt.eval_split
+    if dataset_key == "endovis" and opt.eval_split != "endovis":
+        dataset_key = opt.eval_split
 
     # Keep explicit mapping; do not silently fall back to a different dataset.
     datasets_dict = {
@@ -90,15 +98,30 @@ def build_dataset_and_loader(opt):
     # Load test filenames (default: splits/<eval_split>/test_files.txt, override: --eval_filelist)
     if getattr(opt, "eval_filelist", None):
         fpath = os.path.expanduser(opt.eval_filelist)
+        if not os.path.exists(fpath):
+            raise FileNotFoundError(f"Missing split file: {fpath}")
+        filenames = readlines(fpath)
     else:
         fpath = os.path.join(splits_dir, opt.eval_split, "test_files.txt")
+        if os.path.exists(fpath):
+            filenames = readlines(fpath)
+        elif dataset_key == "c3vd" and build_c3vd_default_filelists is not None:
+            auto_lists = build_c3vd_default_filelists(
+                opt.data_path,
+                write_to_splits_dir=os.path.join(splits_dir, opt.eval_split),
+            )
+            filenames = auto_lists["test"]
+            fpath = f"<auto:{opt.eval_split}/test_files.txt>"
+        else:
+            raise FileNotFoundError(
+                f"Missing split file: {fpath}\n"
+                f"Either create splits/{opt.eval_split}/test_files.txt or pass --eval_filelist."
+            )
 
-    if not os.path.exists(fpath):
-        raise FileNotFoundError(
-            f"Missing split file: {fpath}\n"
-            f"Either create splits/{opt.eval_split}/test_files.txt or pass --eval_filelist."
+    if len(filenames) == 0:
+        raise RuntimeError(
+            f"No evaluation samples found for split '{opt.eval_split}' using filelist '{fpath}'."
         )
-    filenames = readlines(fpath)
 
     # img_ext matches trainer's hamlyn override
     img_ext = ".jpg" if opt.eval_split == "hamlyn" else ".png"
@@ -106,6 +129,17 @@ def build_dataset_and_loader(opt):
     # For evaluation we only need frame 0 (single image per sample)
     frame_ids = [0]
     num_scales = 4
+
+    dataset_kwargs = {"img_ext": img_ext}
+    if dataset_key == "c3vd":
+        dataset_kwargs.update(
+            {
+                "use_intrinsics_file": (not getattr(opt, "learn_intrinsics", True))
+                and getattr(opt, "c3vd_use_intrinsics_file", True),
+                "intrinsics_path": getattr(opt, "c3vd_intrinsics_path", None),
+                "depth_scale": getattr(opt, "c3vd_depth_scale", DEFAULT_C3VD_DEPTH_SCALE),
+            }
+        )
 
     dataset = dataset_cls(
         opt.data_path,
@@ -115,7 +149,7 @@ def build_dataset_and_loader(opt):
         frame_ids,
         num_scales,
         is_train=False,
-        img_ext=img_ext,
+        **dataset_kwargs,
     )
 
     # Use a batch size if available; default to 16 for speed

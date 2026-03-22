@@ -81,6 +81,26 @@ class MonodepthOptions:
             default=True,
         )
 
+        # C3VD intrinsics/depth options
+        self.parser.add_argument(
+            "--c3vd_use_intrinsics_file",
+            type=str2bool,
+            help="(C3VD) Use fixed intrinsics from --c3vd_intrinsics_path when learn_intrinsics is False.",
+            default=True,
+        )
+        self.parser.add_argument(
+            "--c3vd_intrinsics_path",
+            type=str,
+            help="(C3VD) Optional path to a pinhole intrinsics file (txt/json/npy/npz).",
+            default=None,
+        )
+        self.parser.add_argument(
+            "--c3vd_depth_scale",
+            type=float,
+            help="(C3VD) Depth scale to decode *_depth.tiff (default is 100/65535 mm per level).",
+            default=100.0 / 65535.0,
+        )
+
 
         # Hamlyn intrinsics (used when --dataset hamlyn and --learn_intrinsics is False)
         self.parser.add_argument(

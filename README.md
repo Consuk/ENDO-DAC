@@ -39,11 +39,40 @@ Download pretrained model from: [depth_anything_vitb14](https://drive.google.com
 ### SCARED
 Please follow [AF-SfMLearner](https://github.com/ShuweiShao/AF-SfMLearner) to prepare the SCARED dataset.
 
+### C3VD
+This repo now supports C3VD directly for training/evaluation.
+
+Expected structure (your screenshots already match this):
+```
+<C3VD_ROOT>/
+  training/<sequence>/*_color.png
+  validation/<sequence>/*_color.png
+  testing/<sequence>/*_color.png, *_depth.tiff
+```
+
+Notes:
+- C3VD depth is decoded as `depth_mm = raw_uint16 * (100/65535)`.
+- C3VD uses an omnidirectional camera model; for EndoDAC training we recommend `--learn_intrinsics True`.
+- If split files under `splits/c3vd/` are missing, they are auto-generated from the folder structure above.
+- Optional fixed intrinsics can be passed with `--c3vd_intrinsics_path` and used when `--learn_intrinsics False`.
+
+Generate split files explicitly:
+```
+python generate_c3vd_splits.py --data_path <C3VD_ROOT>
+```
+
 ## Utilization
 
 ### Training
 ```
 CUDA_VISIBLE_DEVICES=0 python train_end_to_end.py --data_path <your_data_path> --log_dir './logs'
+```
+
+Example for C3VD:
+```
+CUDA_VISIBLE_DEVICES=0 python train_end_to_end.py \
+  --dataset c3vd --split c3vd --eval_split c3vd \
+  --data_path <C3VD_ROOT> --log_dir ./logs --learn_intrinsics True
 ```
 
 ### Evaluation
@@ -55,10 +84,22 @@ python export_gt_pose.py --data_path <your_data_path> --split endovis --sequence
 python export_gt_pose.py --data_path <your_data_path> --split endovis --sequence sequence1
 ```
 
+Export C3VD depth GT:
+```
+python export_gt_depth.py --data_path <C3VD_ROOT> --split c3vd --useage eval
+```
+
 Assume to evaluate the epoch 19 weights of a __depth estimation model__ named ```endodac```:
 ```
 CUDA_VISIBLE_DEVICES=0 python evaluate_depth.py --data_path <your_data_path> \
 --load_weights_folder './logs/endodac/models/weights_19' --eval_mono
+```
+
+Evaluate on C3VD:
+```
+CUDA_VISIBLE_DEVICES=0 python evaluate_depth.py \
+  --dataset c3vd --eval_split c3vd --data_path <C3VD_ROOT> \
+  --load_weights_folder './logs/endodac/models/weights_19' --eval_mono
 ```
 
 Assume to evaluate the epoch 19 weights of a __pose and intrinsic estimation model__ named ```endodac```:
@@ -69,5 +110,3 @@ CUDA_VISIBLE_DEVICES=0 python evaluate_pose.py --data_path <your_data_path> \
 
 ## Acknowledgment
 Our code is based on the implementation of [AF-SfMLearner](https://github.com/ShuweiShao/AF-SfMLearner), [Depth-Anything](https://github.com/LiheYoung/Depth-Anything). We thank their excellent works.
-
-

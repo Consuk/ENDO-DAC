@@ -20,9 +20,15 @@ from utils.utils import readlines, compute_errors
 
 from datasets.hamlyn_dataset import HamlynDataset
 try:
-    from datasets.c3vd_dataset import C3VDDataset
+    from datasets.c3vd_dataset import (
+        C3VDDataset,
+        DEFAULT_C3VD_DEPTH_SCALE,
+        build_c3vd_default_filelists,
+    )
 except Exception:
     C3VDDataset = None
+    DEFAULT_C3VD_DEPTH_SCALE = 100.0 / 65535.0
+    build_c3vd_default_filelists = None
 from datasets.scared_dataset import SCAREDRAWDataset
 
 import models.endodac as endodac
@@ -59,6 +65,8 @@ def load_gt_depths_npz(eval_split: str, splits_dir: str, gt_depths_path: str = N
 
 def build_dataset(opt):
     dataset_key = getattr(opt, "dataset", None) or opt.eval_split
+    if dataset_key == "endovis" and opt.eval_split != "endovis":
+        dataset_key = opt.eval_split
 
     datasets_dict = {
         "endovis": SCAREDRAWDataset,
@@ -79,16 +87,30 @@ def build_dataset(opt):
 
     if getattr(opt, "eval_filelist", None):
         fpath = os.path.expanduser(opt.eval_filelist)
+        if not os.path.exists(fpath):
+            raise FileNotFoundError(f"Missing split file: {fpath}")
+        filenames = readlines(fpath)
     else:
         fpath = os.path.join(opt.splits_dir, opt.eval_split, "test_files.txt")
+        if os.path.exists(fpath):
+            filenames = readlines(fpath)
+        elif dataset_key == "c3vd" and build_c3vd_default_filelists is not None:
+            auto_lists = build_c3vd_default_filelists(
+                opt.data_path,
+                write_to_splits_dir=os.path.join(opt.splits_dir, opt.eval_split),
+            )
+            filenames = auto_lists["test"]
+            fpath = f"<auto:{opt.eval_split}/test_files.txt>"
+        else:
+            raise FileNotFoundError(
+                f"Missing split file: {fpath}\n"
+                f"Either create {opt.splits_dir}/{opt.eval_split}/test_files.txt or pass --eval_filelist."
+            )
 
-    if not os.path.exists(fpath):
-        raise FileNotFoundError(
-            f"Missing split file: {fpath}\n"
-            f"Either create {opt.splits_dir}/{opt.eval_split}/test_files.txt or pass --eval_filelist."
+    if len(filenames) == 0:
+        raise RuntimeError(
+            f"No evaluation samples found for split '{opt.eval_split}' using filelist '{fpath}'."
         )
-
-    filenames = readlines(fpath)
 
     img_ext = ".jpg" if opt.eval_split == "hamlyn" else ".png"
     if getattr(opt, "img_ext", None) is not None:
@@ -96,6 +118,17 @@ def build_dataset(opt):
 
     frame_ids = [0]
     num_scales = 4
+
+    dataset_kwargs = {"img_ext": img_ext}
+    if dataset_key == "c3vd":
+        dataset_kwargs.update(
+            {
+                "use_intrinsics_file": (not getattr(opt, "learn_intrinsics", True))
+                and getattr(opt, "c3vd_use_intrinsics_file", True),
+                "intrinsics_path": getattr(opt, "c3vd_intrinsics_path", None),
+                "depth_scale": getattr(opt, "c3vd_depth_scale", DEFAULT_C3VD_DEPTH_SCALE),
+            }
+        )
 
     dataset = dataset_cls(
         opt.data_path,
@@ -105,7 +138,7 @@ def build_dataset(opt):
         frame_ids,
         num_scales,
         is_train=False,
-        img_ext=img_ext,
+        **dataset_kwargs,
     )
 
     return dataset, filenames, fpath
@@ -390,6 +423,10 @@ def build_opt_from_args(args, data_path_root):
     opt.gt_depths_path = args.gt_depths_path
     opt.img_ext = args.img_ext
     opt.splits_dir = args.splits_dir
+    opt.learn_intrinsics = bool(args.learn_intrinsics)
+    opt.c3vd_use_intrinsics_file = bool(args.c3vd_use_intrinsics_file)
+    opt.c3vd_intrinsics_path = args.c3vd_intrinsics_path
+    opt.c3vd_depth_scale = float(args.c3vd_depth_scale)
 
     opt.load_weights_folder = args.load_weights_folder
     opt.lora_rank = args.lora_rank
@@ -420,6 +457,14 @@ def main():
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--img_ext", type=str, default=None,
                         help="Force image extension, e.g. .jpg or .png. By default matches evaluate_depth.py logic")
+    parser.add_argument(
+        "--learn_intrinsics",
+        type=lambda v: str(v).lower() in ("1", "true", "yes", "y"),
+        default=True,
+    )
+    parser.add_argument("--c3vd_use_intrinsics_file", type=lambda v: str(v).lower() in ("1", "true", "yes", "y"), default=True)
+    parser.add_argument("--c3vd_intrinsics_path", type=str, default=None)
+    parser.add_argument("--c3vd_depth_scale", type=float, default=DEFAULT_C3VD_DEPTH_SCALE)
 
     parser.add_argument("--eval_stereo", action="store_true")
     parser.add_argument("--post_process", action="store_true")
