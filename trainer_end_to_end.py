@@ -635,6 +635,7 @@ class Trainer:
                 "Expected max > min."
             )
         print(f"[Eval] depth range = [{MIN_DEPTH:.6f}, {MAX_DEPTH:.6f}]")
+        print(f"[Eval] disp2depth range = [{self.opt.min_depth:.6f}, {self.opt.max_depth:.6f}]")
 
         self.set_eval()
         pred_depths = []
@@ -648,7 +649,7 @@ class Trainer:
 
             output = self.models["depth_model"](input_color)
             _, pred_depth = disp_to_depth(
-                output[("disp", 0)], MIN_DEPTH, MAX_DEPTH
+                output[("disp", 0)], self.opt.min_depth, self.opt.max_depth
             )
             pred_depth = pred_depth[:, 0].cpu().detach().numpy()
             pred_depths.append(pred_depth)

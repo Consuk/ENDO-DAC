@@ -237,6 +237,7 @@ def evaluate_one_root(opt, depther, gt_depths):
     print(f"-> Using eval filelist: {eval_filelist_path}")
     print(f"-> Computing predictions with size {opt.width}x{opt.height}")
     print(f"-> Eval depth range: [{eval_min_depth:.6f}, {eval_max_depth:.6f}] ({dataset_key})")
+    print(f"-> Disp2Depth range: [{opt.min_depth:.6f}, {opt.max_depth:.6f}] (model)")
 
     buffer_imgs = []
     buffer_ids = []
@@ -266,7 +267,7 @@ def evaluate_one_root(opt, depther, gt_depths):
             if not isinstance(output, dict) or ("disp", 0) not in output:
                 raise RuntimeError("Model output does not contain ('disp', 0).")
 
-            pred_disp, _ = disp_to_depth(output[("disp", 0)], eval_min_depth, eval_max_depth)
+            pred_disp, _ = disp_to_depth(output[("disp", 0)], opt.min_depth, opt.max_depth)
             pred_disp = pred_disp.cpu()[:, 0].numpy()
 
             if getattr(opt, "post_process", False):

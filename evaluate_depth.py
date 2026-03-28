@@ -253,6 +253,8 @@ def load_model(opt):
 
 def evaluate(opt):
     MIN_DEPTH, MAX_DEPTH, dataset_key = resolve_eval_depth_range(opt)
+    CONV_MIN_DEPTH = float(opt.min_depth)
+    CONV_MAX_DEPTH = float(opt.max_depth)
 
     assert sum((opt.eval_mono, opt.eval_stereo)) == 1, \
         "Choose mono or stereo with --eval_mono or --eval_stereo"
@@ -279,6 +281,7 @@ def evaluate(opt):
     print(f"-> Using eval filelist: {eval_filelist_path}")
     print(f"-> Using gt depths:    {gt_depths_path}")
     print(f"-> Eval depth range:   [{MIN_DEPTH:.6f}, {MAX_DEPTH:.6f}] ({dataset_key})")
+    print(f"-> Disp2Depth range:   [{CONV_MIN_DEPTH:.6f}, {CONV_MAX_DEPTH:.6f}] (model)")
 
     # ----------------------------
     # Predict
@@ -319,7 +322,9 @@ def evaluate(opt):
                 if not isinstance(output, dict) or ("disp", 0) not in output:
                     raise RuntimeError("Model output does not contain ('disp', 0).")
 
-                pred_disp, _ = disp_to_depth(output[("disp", 0)], MIN_DEPTH, MAX_DEPTH)
+                pred_disp, _ = disp_to_depth(
+                    output[("disp", 0)], CONV_MIN_DEPTH, CONV_MAX_DEPTH
+                )
                 pred_disp = pred_disp.cpu()[:, 0].numpy()  # (B,H,W)
 
                 pred_disps_list.append(pred_disp)
@@ -401,7 +406,7 @@ def evaluate(opt):
     cls = []
     for k in range(len(mean_errors)):
         cl = st.t.interval(
-            alpha=0.95,
+            confidence=0.95,
             df=len(errors) - 1,
             loc=mean_errors[k],
             scale=st.sem(errors[:, k]),

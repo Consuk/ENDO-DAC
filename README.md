@@ -101,6 +101,7 @@ Evaluate on C3VD:
 CUDA_VISIBLE_DEVICES=0 python evaluate_depth.py \
   --dataset c3vd --eval_split c3vd --data_path <C3VD_ROOT> \
   --load_weights_folder './logs/endodac/models/weights_19' --eval_mono \
+  --min_depth 0.1 --max_depth 150.0 \
   --c3vd_eval_min_depth 0.001 --c3vd_eval_max_depth 100.0
 ```
 
