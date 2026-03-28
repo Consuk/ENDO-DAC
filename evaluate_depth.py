@@ -65,6 +65,31 @@ def load_gt_depths_npz(eval_split: str, gt_depths_path: str = None):
     return gt_depths, gt_path
 
 
+def resolve_eval_depth_range(opt):
+    """
+    Resolve metric masking range for evaluation.
+    For C3VD, default to the dataset depth encoding range (0-100 mm).
+    """
+    dataset_key = getattr(opt, "dataset", None) or opt.eval_split
+    if dataset_key == "endovis" and opt.eval_split != "endovis":
+        dataset_key = opt.eval_split
+
+    if dataset_key == "c3vd" or opt.eval_split == "c3vd":
+        min_depth = float(getattr(opt, "c3vd_eval_min_depth", 1e-3))
+        max_depth = float(getattr(opt, "c3vd_eval_max_depth", 100.0))
+    else:
+        min_depth = float(opt.min_depth)
+        max_depth = float(opt.max_depth)
+
+    if max_depth <= min_depth:
+        raise ValueError(
+            f"Invalid evaluation depth range: min={min_depth}, max={max_depth}. "
+            "Expected max > min."
+        )
+
+    return min_depth, max_depth, dataset_key
+
+
 def build_dataset_and_loader(opt):
     """
     Trainer-style dataset wiring:
@@ -227,8 +252,7 @@ def load_model(opt):
 
 
 def evaluate(opt):
-    MIN_DEPTH = opt.min_depth
-    MAX_DEPTH = opt.max_depth
+    MIN_DEPTH, MAX_DEPTH, dataset_key = resolve_eval_depth_range(opt)
 
     assert sum((opt.eval_mono, opt.eval_stereo)) == 1, \
         "Choose mono or stereo with --eval_mono or --eval_stereo"
@@ -254,6 +278,7 @@ def evaluate(opt):
 
     print(f"-> Using eval filelist: {eval_filelist_path}")
     print(f"-> Using gt depths:    {gt_depths_path}")
+    print(f"-> Eval depth range:   [{MIN_DEPTH:.6f}, {MAX_DEPTH:.6f}] ({dataset_key})")
 
     # ----------------------------
     # Predict
@@ -294,7 +319,7 @@ def evaluate(opt):
                 if not isinstance(output, dict) or ("disp", 0) not in output:
                     raise RuntimeError("Model output does not contain ('disp', 0).")
 
-                pred_disp, _ = disp_to_depth(output[("disp", 0)], opt.min_depth, opt.max_depth)
+                pred_disp, _ = disp_to_depth(output[("disp", 0)], MIN_DEPTH, MAX_DEPTH)
                 pred_disp = pred_disp.cpu()[:, 0].numpy()  # (B,H,W)
 
                 pred_disps_list.append(pred_disp)
@@ -337,6 +362,9 @@ def evaluate(opt):
         pred_disp = cv2.resize(pred_disp, (gt_w, gt_h))
         pred_depth = 1.0 / np.maximum(pred_disp, 1e-6)
 
+        # Legacy invalid-value handling for raw uint16-style GT exports.
+        # C3VD GT exported by export_gt_depth.py is already decoded to mm, so this
+        # condition will not affect valid C3VD values.
         gt_depth[gt_depth >= 65535 - 1e-3] = 0.0
 
         mask = (gt_depth > MIN_DEPTH) & (gt_depth < MAX_DEPTH)

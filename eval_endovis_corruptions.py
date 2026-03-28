@@ -206,8 +206,29 @@ def compute_confidence_intervals(errors):
     return mean_errors, np.asarray(cls, dtype=np.float64)
 
 
+def resolve_eval_depth_range(opt):
+    dataset_key = getattr(opt, "dataset", None) or opt.eval_split
+    if dataset_key == "endovis" and opt.eval_split != "endovis":
+        dataset_key = opt.eval_split
+
+    if dataset_key == "c3vd" or opt.eval_split == "c3vd":
+        min_depth = float(getattr(opt, "c3vd_eval_min_depth", 1e-3))
+        max_depth = float(getattr(opt, "c3vd_eval_max_depth", 100.0))
+    else:
+        min_depth = float(opt.min_depth)
+        max_depth = float(opt.max_depth)
+
+    if max_depth <= min_depth:
+        raise ValueError(
+            f"Invalid evaluation depth range: min={min_depth}, max={max_depth}. "
+            "Expected max > min."
+        )
+    return min_depth, max_depth, dataset_key
+
+
 def evaluate_one_root(opt, depther, gt_depths):
     dataset, filenames, eval_filelist_path = build_dataset(opt)
+    eval_min_depth, eval_max_depth, dataset_key = resolve_eval_depth_range(opt)
 
     inference_times = []
     pred_disps_list = []
@@ -215,6 +236,7 @@ def evaluate_one_root(opt, depther, gt_depths):
 
     print(f"-> Using eval filelist: {eval_filelist_path}")
     print(f"-> Computing predictions with size {opt.width}x{opt.height}")
+    print(f"-> Eval depth range: [{eval_min_depth:.6f}, {eval_max_depth:.6f}] ({dataset_key})")
 
     buffer_imgs = []
     buffer_ids = []
@@ -244,7 +266,7 @@ def evaluate_one_root(opt, depther, gt_depths):
             if not isinstance(output, dict) or ("disp", 0) not in output:
                 raise RuntimeError("Model output does not contain ('disp', 0).")
 
-            pred_disp, _ = disp_to_depth(output[("disp", 0)], opt.min_depth, opt.max_depth)
+            pred_disp, _ = disp_to_depth(output[("disp", 0)], eval_min_depth, eval_max_depth)
             pred_disp = pred_disp.cpu()[:, 0].numpy()
 
             if getattr(opt, "post_process", False):
@@ -329,7 +351,7 @@ def evaluate_one_root(opt, depther, gt_depths):
         pred_depth = 1.0 / np.maximum(pred_disp, 1e-6)
 
         gt_depth[gt_depth >= 65535 - 1e-3] = 0.0
-        mask = (gt_depth > opt.min_depth) & (gt_depth < opt.max_depth)
+        mask = (gt_depth > eval_min_depth) & (gt_depth < eval_max_depth)
 
         pred_depth = pred_depth[mask]
         gt_valid = gt_depth[mask]
@@ -342,8 +364,8 @@ def evaluate_one_root(opt, depther, gt_depths):
             ratios.append(ratio)
             pred_depth *= ratio
 
-        pred_depth[pred_depth < opt.min_depth] = opt.min_depth
-        pred_depth[pred_depth > opt.max_depth] = opt.max_depth
+        pred_depth[pred_depth < eval_min_depth] = eval_min_depth
+        pred_depth[pred_depth > eval_max_depth] = eval_max_depth
 
         gt_valid = np.asarray(gt_valid, dtype=np.float32)
         pred_depth = np.asarray(pred_depth, dtype=np.float32)
@@ -427,6 +449,8 @@ def build_opt_from_args(args, data_path_root):
     opt.c3vd_use_intrinsics_file = bool(args.c3vd_use_intrinsics_file)
     opt.c3vd_intrinsics_path = args.c3vd_intrinsics_path
     opt.c3vd_depth_scale = float(args.c3vd_depth_scale)
+    opt.c3vd_eval_min_depth = float(args.c3vd_eval_min_depth)
+    opt.c3vd_eval_max_depth = float(args.c3vd_eval_max_depth)
 
     opt.load_weights_folder = args.load_weights_folder
     opt.lora_rank = args.lora_rank
@@ -465,6 +489,8 @@ def main():
     parser.add_argument("--c3vd_use_intrinsics_file", type=lambda v: str(v).lower() in ("1", "true", "yes", "y"), default=True)
     parser.add_argument("--c3vd_intrinsics_path", type=str, default=None)
     parser.add_argument("--c3vd_depth_scale", type=float, default=DEFAULT_C3VD_DEPTH_SCALE)
+    parser.add_argument("--c3vd_eval_min_depth", type=float, default=1e-3)
+    parser.add_argument("--c3vd_eval_max_depth", type=float, default=100.0)
 
     parser.add_argument("--eval_stereo", action="store_true")
     parser.add_argument("--post_process", action="store_true")

@@ -206,6 +206,18 @@ class MonodepthOptions:
             default=150.0,
         )
         self.parser.add_argument(
+            "--c3vd_eval_min_depth",
+            type=float,
+            help="(C3VD eval) minimum valid depth in mm for metric masking.",
+            default=1e-3,
+        )
+        self.parser.add_argument(
+            "--c3vd_eval_max_depth",
+            type=float,
+            help="(C3VD eval) maximum valid depth in mm for metric masking.",
+            default=100.0,
+        )
+        self.parser.add_argument(
             "--use_stereo",
             help="if set, uses stereo pair for training",
             action="store_true",

@@ -622,8 +622,19 @@ class Trainer:
             )
 
         print("Evaluating")
-        MIN_DEPTH = 1e-3
-        MAX_DEPTH = 150
+        if self.opt.dataset == "c3vd" or self.opt.eval_split == "c3vd":
+            MIN_DEPTH = float(getattr(self.opt, "c3vd_eval_min_depth", 1e-3))
+            MAX_DEPTH = float(getattr(self.opt, "c3vd_eval_max_depth", 100.0))
+        else:
+            MIN_DEPTH = float(self.opt.min_depth)
+            MAX_DEPTH = float(self.opt.max_depth)
+
+        if MAX_DEPTH <= MIN_DEPTH:
+            raise ValueError(
+                f"Invalid evaluation depth range: min={MIN_DEPTH}, max={MAX_DEPTH}. "
+                "Expected max > min."
+            )
+        print(f"[Eval] depth range = [{MIN_DEPTH:.6f}, {MAX_DEPTH:.6f}]")
 
         self.set_eval()
         pred_depths = []
@@ -637,7 +648,7 @@ class Trainer:
 
             output = self.models["depth_model"](input_color)
             _, pred_depth = disp_to_depth(
-                output[("disp", 0)], self.opt.min_depth, self.opt.max_depth
+                output[("disp", 0)], MIN_DEPTH, MAX_DEPTH
             )
             pred_depth = pred_depth[:, 0].cpu().detach().numpy()
             pred_depths.append(pred_depth)
