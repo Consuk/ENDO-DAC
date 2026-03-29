@@ -157,15 +157,32 @@ class MonoDataset(data.Dataset):
         # ------------------------------------------------------------------------
 
         
-        if len(line) == 3:
-            frame_index = int(line[1])
-        else:
-            frame_index = 0
+        explicit_frame_map = None
+        frame_index = 0
+        side = None
 
-        if len(line) == 3:
-            side = line[2]
+        # Default format:
+        #   <folder> <frame_idx> <side>
+        #
+        # Also support explicit triplet format (used by MonoLoT C3VD splits):
+        #   <folder> <prev_idx> <center_idx> <next_idx> [side]
+        if len(line) >= 4:
+            try:
+                prev_idx = int(line[1])
+                center_idx = int(line[2])
+                next_idx = int(line[3])
+                explicit_frame_map = {-1: prev_idx, 0: center_idx, 1: next_idx}
+                frame_index = center_idx
+                side = line[4] if len(line) >= 5 else "l"
+            except Exception:
+                # Fallback to standard format if not all tokens are frame indices.
+                if len(line) >= 2:
+                    frame_index = int(line[1])
+                side = line[2] if len(line) >= 3 else None
         else:
-            side = None
+            if len(line) >= 2:
+                frame_index = int(line[1])
+            side = line[2] if len(line) >= 3 else None
 
         # frame_id = "{:06d}".format(int(frame_index))
         inputs["frame_id"] = torch.from_numpy(np.array(frame_index))
@@ -175,7 +192,11 @@ class MonoDataset(data.Dataset):
                 other_side = {"r": "l", "l": "r"}[side]
                 inputs[("color", i, -1)] = self.get_color(folder, frame_index, other_side, do_flip)
             else:
-                inputs[("color", i, -1)] = self.get_color(folder, frame_index + i, side, do_flip)
+                if explicit_frame_map is not None and i in explicit_frame_map:
+                    source_frame_idx = explicit_frame_map[i]
+                else:
+                    source_frame_idx = frame_index + i
+                inputs[("color", i, -1)] = self.get_color(folder, source_frame_idx, side, do_flip)
 
         # adjusting intrinsics to match each scale in the pyramid
         for scale in range(self.num_scales):

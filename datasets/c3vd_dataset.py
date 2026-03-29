@@ -130,16 +130,42 @@ def _resolve_c3vd_folder_rel(data_path: str, folder_token: str) -> str:
       - explicit subsets (training/..., validation/..., testing/...)
       - sequence-only folder names (e.g. cecum_t1_a)
     """
-    token = folder_token.strip().strip("/\\")
-    candidate_rels = [
-        token,
-        os.path.join("training", token),
-        os.path.join("validation", token),
-        os.path.join("testing", token),
-    ]
+    token = folder_token.strip().replace("\\", "/").strip("/")
+
+    # Accept MonoLoT-style tokens, e.g.:
+    #   cecum_t1_a_under_review
+    #   cecum_t1_a_under_review/c1v1
+    token_heads = [token]
+    if "/" in token:
+        token_heads.append(token.split("/", 1)[0])
+
+    normalized_tokens = []
+    for t in token_heads:
+        if t and t not in normalized_tokens:
+            normalized_tokens.append(t)
+        if t.endswith("_under_review"):
+            t2 = t[: -len("_under_review")]
+            if t2 and t2 not in normalized_tokens:
+                normalized_tokens.append(t2)
+
+    candidate_rels = []
+    for t in normalized_tokens:
+        candidate_rels.extend(
+            [
+                t,
+                os.path.join("training", t),
+                os.path.join("validation", t),
+                os.path.join("testing", t),
+            ]
+        )
+
     for rel in candidate_rels:
         if os.path.isdir(os.path.join(data_path, rel)):
             return _as_posix(rel)
+
+    # Best-effort fallback: return the first normalized token.
+    if len(normalized_tokens) > 0:
+        return _as_posix(normalized_tokens[0])
     return _as_posix(token)
 
 
@@ -595,7 +621,10 @@ class C3VDDataset(MonoDataset):
             if len(line) < 2:
                 return False
             folder = line[0]
-            frame_index = int(line[1])
+            if len(line) >= 4:
+                frame_index = int(line[2])
+            else:
+                frame_index = int(line[1])
         except Exception:
             return False
 

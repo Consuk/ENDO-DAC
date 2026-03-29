@@ -46,16 +46,37 @@ def _collect_depth_map(folder):
 
 
 def _resolve_c3vd_folder_rel(data_path, folder_token):
-    token = folder_token.strip().strip("/\\")
-    candidates = [
-        token,
-        os.path.join("training", token),
-        os.path.join("validation", token),
-        os.path.join("testing", token),
-    ]
+    token = folder_token.strip().replace("\\", "/").strip("/")
+
+    token_heads = [token]
+    if "/" in token:
+        token_heads.append(token.split("/", 1)[0])
+
+    normalized_tokens = []
+    for t in token_heads:
+        if t and t not in normalized_tokens:
+            normalized_tokens.append(t)
+        if t.endswith("_under_review"):
+            t2 = t[: -len("_under_review")]
+            if t2 and t2 not in normalized_tokens:
+                normalized_tokens.append(t2)
+
+    candidates = []
+    for t in normalized_tokens:
+        candidates.extend(
+            [
+                t,
+                os.path.join("training", t),
+                os.path.join("validation", t),
+                os.path.join("testing", t),
+            ]
+        )
     for rel in candidates:
         if os.path.isdir(os.path.join(data_path, rel)):
             return rel.replace("\\", "/")
+
+    if normalized_tokens:
+        return normalized_tokens[0].replace("\\", "/")
     return token.replace("\\", "/")
 
 
@@ -98,6 +119,22 @@ def build_c3vd_default_filelists(data_path, write_to_splits_dir=None):
 
     filelists = generate_splits(data_path, write_to_splits_dir or os.path.join(os.path.dirname(__file__), "splits", "c3vd"))
     return filelists
+
+
+def _parse_frame_id(parts, split_name):
+    """
+    Parse frame index from split line tokens.
+    For C3VD we additionally support MonoLoT triplet lines:
+      <folder> <prev_idx> <center_idx> <next_idx>
+    and use center_idx for GT export/evaluation alignment.
+    """
+    if split_name == "c3vd" and len(parts) >= 4:
+        try:
+            int(parts[1]); int(parts[2]); int(parts[3])
+            return int(parts[2])
+        except Exception:
+            pass
+    return int(parts[1])
 
 
 def export_gt_depths_kitti():
@@ -200,7 +237,7 @@ def export_gt_depths_kitti():
         if len(parts) < 2:
             raise ValueError(f"Invalid line in split file '{split_file}' at line {i + 1}: '{line}'")
         folder = parts[0]
-        frame_id = int(parts[1])
+        frame_id = _parse_frame_id(parts, opt.split)
         side = parts[2] if len(parts) > 2 else None
         # Print progress
         print(f"[{i+1:05d}] {folder} frame {frame_id}")
