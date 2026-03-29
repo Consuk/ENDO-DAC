@@ -425,10 +425,14 @@ def _parse_intrinsics_file(path: str) -> Optional[np.ndarray]:
 
 
 def _default_normalized_k4() -> np.ndarray:
+    # Default to the fixed normalized C3VD intrinsics used by MonoLoT.
+    # Reason: this is a stronger and more reproducible baseline for C3VD than
+    # the generic centered K=[0.5, 0.5], and it better matches common
+    # Monodepth2-style training practice on this dataset.
     return np.array(
         [
-            [0.5, 0.0, 0.5, 0.0],
-            [0.0, 0.5, 0.5, 0.0],
+            [0.56959306, 0.0, 0.5, 0.0],
+            [0.0, 0.71185083, 0.5, 0.0],
             [0.0, 0.0, 1.0, 0.0],
             [0.0, 0.0, 0.0, 1.0],
         ],
