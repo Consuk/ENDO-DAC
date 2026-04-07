@@ -497,16 +497,24 @@ class C3VDDataset(MonoDataset):
         depth_scale=DEFAULT_C3VD_DEPTH_SCALE,
         intrinsics_path=None,
         use_intrinsics_file=True,
+        use_loss_mask=False,
+        mask_filename="mask.png",
+        mask_erosion=0,
         allow_nearest_when_missing=True,
         **kwargs,
     ):
         self.depth_scale = float(depth_scale)
         self._intrinsics_path_arg = intrinsics_path
         self.use_intrinsics_file = bool(use_intrinsics_file)
+        self.use_loss_mask = bool(use_loss_mask)
+        self.mask_filename = str(mask_filename)
+        self.mask_erosion = max(0, int(mask_erosion))
         self.allow_nearest_when_missing = bool(allow_nearest_when_missing)
 
         # Built after base init
         self.folder_info: Dict[str, dict] = {}
+        self._global_intrinsics_path: Optional[str] = None
+        self._mask_cache: Dict[str, Optional[np.ndarray]] = {}
 
         super(C3VDDataset, self).__init__(
             data_path,
@@ -550,6 +558,87 @@ class C3VDDataset(MonoDataset):
                 "sorted_indices": sorted(color_map.keys()),
             }
 
+            k4, used_file = self._resolve_intrinsics_for_sequence(self.folder_info[folder_token])
+            self.folder_info[folder_token]["K4"] = k4
+            self.folder_info[folder_token]["intrinsics_from_file"] = int(used_file)
+            self.folder_info[folder_token]["mask_path"] = self._resolve_mask_path(
+                self.folder_info[folder_token]
+            )
+
+    def _sequence_intrinsics_candidates(self, info: dict) -> List[str]:
+        seq_abs = info["sequence_abs"]
+        return [
+            os.path.join(seq_abs, "intrinsics.txt"),
+            os.path.join(seq_abs, "camera_intrinsics.txt"),
+            os.path.join(seq_abs, "K.txt"),
+            os.path.join(seq_abs, "calibration", "intrinsics.txt"),
+            os.path.join(seq_abs, "calibration", "camera_intrinsics.txt"),
+            os.path.join(seq_abs, "calibration", "K.txt"),
+        ]
+
+    def _resolve_intrinsics_for_sequence(self, info: dict) -> Tuple[np.ndarray, int]:
+        if not self.use_intrinsics_file:
+            return _default_normalized_k4(), 0
+
+        # 1) Prefer per-sequence intrinsics files.
+        for p in self._sequence_intrinsics_candidates(info):
+            if os.path.isfile(p):
+                k4 = _parse_intrinsics_file(p)
+                if k4 is not None:
+                    return k4.astype(np.float32), 1
+
+        # 2) Fall back to optional global intrinsics file.
+        if self._global_intrinsics_path is None:
+            self._global_intrinsics_path = self._auto_intrinsics_file()
+        if self._global_intrinsics_path is not None:
+            k4 = _parse_intrinsics_file(self._global_intrinsics_path)
+            if k4 is not None:
+                return k4.astype(np.float32), 1
+
+        # 3) Fixed normalized fallback.
+        return _default_normalized_k4(), 0
+
+    def _resolve_mask_path(self, info: dict) -> Optional[str]:
+        if not self.use_loss_mask:
+            return None
+        seq_abs = info["sequence_abs"]
+        candidates = [
+            os.path.join(seq_abs, self.mask_filename),
+            os.path.join(info["color_root"], self.mask_filename),
+            os.path.join(info["depth_root"], self.mask_filename),
+        ]
+        for p in candidates:
+            if os.path.isfile(p):
+                return p
+        return None
+
+    def _ensure_folder_info(self, folder: str) -> dict:
+        info = self.folder_info.get(folder)
+        if info is not None:
+            return info
+
+        # Resolve lazily if split token wasn't in the initial map.
+        folder_rel = _resolve_c3vd_folder_rel(self.data_path, folder)
+        seq_abs = os.path.join(self.data_path, folder_rel)
+        color_root, depth_root = _discover_c3vd_roots(seq_abs)
+        color_map = _collect_indexed_files(color_root, "color")
+        depth_map = _collect_indexed_files(depth_root, "depth")
+        info = {
+            "folder_rel": folder_rel,
+            "sequence_abs": seq_abs,
+            "color_root": color_root,
+            "depth_root": depth_root,
+            "color_map": color_map,
+            "depth_map": depth_map,
+            "sorted_indices": sorted(color_map.keys()),
+        }
+        k4, used_file = self._resolve_intrinsics_for_sequence(info)
+        info["K4"] = k4
+        info["intrinsics_from_file"] = int(used_file)
+        info["mask_path"] = self._resolve_mask_path(info)
+        self.folder_info[folder] = info
+        return info
+
     def _auto_intrinsics_file(self) -> Optional[str]:
         if self._intrinsics_path_arg:
             p = os.path.abspath(os.path.expanduser(self._intrinsics_path_arg))
@@ -571,18 +660,61 @@ class C3VDDataset(MonoDataset):
         return None
 
     def _load_intrinsics_k4(self) -> np.ndarray:
-        if not self.use_intrinsics_file:
-            return _default_normalized_k4()
+        # Keep a global default for base-class compatibility; per-sample K is provided
+        # through get_intrinsics_for_sample().
+        if len(self.folder_info) > 0:
+            first = sorted(self.folder_info.keys())[0]
+            return self.folder_info[first]["K4"].astype(np.float32)
+        return _default_normalized_k4()
 
-        path = self._auto_intrinsics_file()
-        if path is None:
-            return _default_normalized_k4()
+    def get_intrinsics_for_sample(self, folder, frame_index, side, do_flip):
+        _ = frame_index
+        _ = side
+        _ = do_flip
+        info = self._ensure_folder_info(folder)
+        return info.get("K4", _default_normalized_k4()).astype(np.float32), int(
+            info.get("intrinsics_from_file", 0)
+        )
 
-        k4 = _parse_intrinsics_file(path)
-        if k4 is None:
-            return _default_normalized_k4()
+    def _get_or_load_mask(self, folder: str) -> Optional[np.ndarray]:
+        if not self.use_loss_mask:
+            return None
+        if folder in self._mask_cache:
+            return self._mask_cache[folder]
 
-        return k4.astype(np.float32)
+        info = self._ensure_folder_info(folder)
+        mask_path = info.get("mask_path", None)
+        if mask_path is None:
+            self._mask_cache[folder] = None
+            return None
+
+        mask = cv2.imread(mask_path, cv2.IMREAD_UNCHANGED)
+        if mask is None:
+            self._mask_cache[folder] = None
+            return None
+        if mask.ndim == 3:
+            mask = mask[:, :, 0]
+        mask = (mask > 0).astype(np.uint8)
+
+        if self.mask_erosion > 0:
+            k = 2 * self.mask_erosion + 1
+            kernel = np.ones((k, k), dtype=np.uint8)
+            mask = cv2.erode(mask, kernel, iterations=1)
+
+        mask = mask.astype(np.float32)
+        self._mask_cache[folder] = mask
+        return mask
+
+    def get_loss_mask(self, folder, frame_index, side, do_flip):
+        _ = frame_index
+        _ = side
+        mask = self._get_or_load_mask(folder)
+        if mask is None:
+            return None
+        out = mask.copy()
+        if do_flip:
+            out = np.fliplr(out)
+        return out
 
     def _get_nearest_idx(self, sorted_indices: List[int], target: int) -> int:
         if len(sorted_indices) == 0:
@@ -636,23 +768,7 @@ class C3VDDataset(MonoDataset):
 
     def get_color(self, folder, frame_index, side, do_flip):
         _ = side  # kept for interface compatibility
-        info = self.folder_info.get(folder)
-        if info is None:
-            # Resolve lazily if split token wasn't in the initial map.
-            folder_rel = _resolve_c3vd_folder_rel(self.data_path, folder)
-            seq_abs = os.path.join(self.data_path, folder_rel)
-            color_root, depth_root = _discover_c3vd_roots(seq_abs)
-            color_map = _collect_indexed_files(color_root, "color")
-            self.folder_info[folder] = {
-                "folder_rel": folder_rel,
-                "sequence_abs": seq_abs,
-                "color_root": color_root,
-                "depth_root": depth_root,
-                "color_map": color_map,
-                "depth_map": _collect_indexed_files(depth_root, "depth"),
-                "sorted_indices": sorted(color_map.keys()),
-            }
-            info = self.folder_info[folder]
+        info = self._ensure_folder_info(folder)
 
         color_name = self._resolve_color_name(folder, frame_index)
         color_path = os.path.join(info["color_root"], color_name)

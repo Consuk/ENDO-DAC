@@ -232,7 +232,12 @@ class Trainer:
         # Default to SCAREDRAWDataset if an unknown dataset is specified
         self.dataset = datasets_dict.get(self.opt.dataset, datasets.SCAREDRAWDataset)
 
-        split_dir = os.path.join(os.path.dirname(__file__), "splits", self.opt.split)
+        split_root = (
+            os.path.abspath(os.path.expanduser(self.opt.split_root))
+            if getattr(self.opt, "split_root", None)
+            else os.path.join(os.path.dirname(__file__), "splits")
+        )
+        split_dir = os.path.join(split_root, self.opt.split)
         fpath = os.path.join(split_dir, "{}_files.txt")
         train_file = fpath.format("train")
         val_file = fpath.format("val")
@@ -303,6 +308,9 @@ class Trainer:
                     "depth_scale": getattr(
                         self.opt, "c3vd_depth_scale", DEFAULT_C3VD_DEPTH_SCALE
                     ),
+                    "use_loss_mask": getattr(self.opt, "c3vd_use_loss_mask", False),
+                    "mask_filename": getattr(self.opt, "c3vd_mask_filename", "mask.png"),
+                    "mask_erosion": getattr(self.opt, "c3vd_mask_erosion", 0),
                 }
             )
 
@@ -838,6 +846,15 @@ class Trainer:
                 occu_mask_backward = outputs[
                     ("occu_mask_backward", 0, frame_id)
                 ].detach()
+                loss_mask = self._loss_mask_for(
+                    inputs, scale, outputs[("registration", scale, frame_id)]
+                )
+                valid_mask = (
+                    occu_mask_backward
+                    if loss_mask is None
+                    else (occu_mask_backward * loss_mask)
+                )
+                valid_denom = torch.clamp(valid_mask.sum(), min=1e-6)
                 loss_smooth_registration += get_smooth_loss(
                     outputs[("position", scale, frame_id)], color
                 )
@@ -846,8 +863,8 @@ class Trainer:
                         outputs[("registration", scale, frame_id)],
                         outputs[("refined", scale, frame_id)].detach(),
                     )
-                    * occu_mask_backward
-                ).sum() / occu_mask_backward.sum()
+                    * valid_mask
+                ).sum() / valid_denom
 
             loss += loss_registration / 2.0
             loss += (
@@ -1067,6 +1084,28 @@ class Trainer:
 
         return reprojection_loss
 
+    def _loss_mask_for(self, inputs, scale, ref_tensor):
+        """Return optional dataset-provided valid-region mask aligned to ref_tensor."""
+        mask = None
+        if ("loss_mask", scale) in inputs:
+            mask = inputs[("loss_mask", scale)]
+        elif "loss_mask" in inputs:
+            mask = inputs["loss_mask"]
+
+        if mask is None:
+            return None
+
+        if mask.ndim == 2:
+            mask = mask.unsqueeze(0).unsqueeze(0)
+        elif mask.ndim == 3:
+            mask = mask.unsqueeze(1)
+
+        mask = mask.float()
+        if mask.shape[-2:] != ref_tensor.shape[-2:]:
+            mask = F.interpolate(mask, size=ref_tensor.shape[-2:], mode="nearest")
+
+        return (mask > 0.5).float()
+
     def compute_losses(self, inputs, outputs):
         """Compute main training losses."""
         losses = {}
@@ -1085,26 +1124,35 @@ class Trainer:
                 occu_mask_backward = outputs[
                     ("occu_mask_backward", 0, frame_id)
                 ].detach()
+                loss_mask = self._loss_mask_for(
+                    inputs, scale, outputs[("refined", scale, frame_id)]
+                )
+                valid_mask = (
+                    occu_mask_backward
+                    if loss_mask is None
+                    else (occu_mask_backward * loss_mask)
+                )
+                valid_denom = torch.clamp(valid_mask.sum(), min=1e-6)
 
                 loss_reprojection += (
                     self.compute_reprojection_loss(
                         outputs[("color", frame_id, scale)],
                         outputs[("refined", scale, frame_id)],
                     )
-                    * occu_mask_backward
-                ).sum() / occu_mask_backward.sum()
+                    * valid_mask
+                ).sum() / valid_denom
                 loss_transform += (
                     torch.abs(
                         outputs[("refined", scale, frame_id)]
                         - outputs[("registration", 0, frame_id)].detach()
                     ).mean(1, True)
-                    * occu_mask_backward
-                ).sum() / occu_mask_backward.sum()
+                    * valid_mask
+                ).sum() / valid_denom
                 loss_cvt += get_smooth_bright(
                     outputs[("transform", "high", scale, frame_id)],
                     inputs[("color", 0, 0)],
                     outputs[("registration", scale, frame_id)].detach(),
-                    occu_mask_backward,
+                    valid_mask,
                 )
 
             mean_disp = disp.mean(2, True).mean(3, True)

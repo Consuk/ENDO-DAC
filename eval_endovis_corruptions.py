@@ -41,6 +41,31 @@ class EvalOptions:
     pass
 
 
+def apply_eval_preset(args):
+    preset = (args.preset or "none").lower()
+    if preset == "none":
+        return args
+
+    if preset == "c3vd_md2":
+        # Monodepth2-style C3VD corruption-eval defaults used in this project.
+        args.dataset = "c3vd"
+        args.split = "c3vd"
+        args.height = 256
+        args.width = 320
+        args.batch_size = 8
+        args.min_depth = 0.1
+        args.max_depth = 100.0
+        args.c3vd_eval_min_depth = 0.1
+        args.c3vd_eval_max_depth = 100.0
+        print(
+            "[Preset] Applied c3vd_md2: "
+            "dataset/split=c3vd, size=320x256, batch=8, depth range=[0.1, 100.0]"
+        )
+        return args
+
+    raise ValueError(f"Unknown preset '{args.preset}'.")
+
+
 def load_gt_depths_npz(eval_split: str, splits_dir: str, gt_depths_path: str = None):
     if gt_depths_path is not None:
         gt_path = os.path.expanduser(gt_depths_path)
@@ -427,6 +452,25 @@ def save_csv(path, header, rows):
         writer.writerows(rows)
 
 
+def weighted_means_from_rows(rows):
+    # rows format:
+    # [corruption, severity, num_samples, avg_inference_ms, abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3]
+    vals = np.array([r[2:] for r in rows], dtype=np.float64)
+    weights = vals[:, 0]
+
+    if np.sum(weights) > 0:
+        total_samples = float(np.sum(weights))
+        w = weights / total_samples
+        weighted = np.sum(vals * w[:, None], axis=0)
+        weighted[0] = total_samples
+    else:
+        weighted = np.mean(vals, axis=0)
+        total_samples = float(np.sum(weights))
+        weighted[0] = total_samples
+
+    return weighted.tolist()
+
+
 def build_opt_from_args(args, data_path_root):
     opt = EvalOptions()
     opt.data_path = data_path_root
@@ -464,6 +508,16 @@ def build_opt_from_args(args, data_path_root):
 
 def main():
     parser = argparse.ArgumentParser("Evaluate corruptions using EndoDAC with evaluate_depth.py logic")
+    parser.add_argument(
+        "--preset",
+        type=str,
+        default="none",
+        choices=["none", "c3vd_md2"],
+        help=(
+            "Optional preset for common settings. "
+            "c3vd_md2 applies C3VD Monodepth2-style eval defaults."
+        ),
+    )
     parser.add_argument("--corruptions_root", type=str, required=True,
                         help="Root containing corruption folders or a single corruption folder with severity_* subfolders")
     parser.add_argument("--load_weights_folder", type=str, required=True,
@@ -511,6 +565,7 @@ def main():
     parser.add_argument("--global_avg_filename", type=str, default="global_average.csv")
     parser.add_argument("--ci_filename", type=str, default="confidence_intervals_by_severity.csv")
     args = parser.parse_args()
+    args = apply_eval_preset(args)
 
     args.splits_dir = os.path.expanduser(args.splits_dir)
 
@@ -603,16 +658,14 @@ def main():
 
     per_corr_rows = []
     for corr in sorted(bucket.keys()):
-        vals = np.array([r[2:] for r in bucket[corr]], dtype=np.float64)
-        means = vals.mean(axis=0).tolist()
+        means = weighted_means_from_rows(bucket[corr])
         per_corr_rows.append([corr] + means)
 
     per_corr_header = ["corruption", "num_samples", "avg_inference_ms", "abs_rel", "sq_rel", "rmse", "rmse_log", "a1", "a2", "a3"]
     per_corr_csv = os.path.join(run_output_dir, args.per_corruption_filename)
     save_csv(per_corr_csv, per_corr_header, per_corr_rows)
 
-    all_vals = np.array([r[2:] for r in rows], dtype=np.float64)
-    global_means = all_vals.mean(axis=0).tolist()
+    global_means = weighted_means_from_rows(rows)
     global_csv = os.path.join(run_output_dir, args.global_avg_filename)
     save_csv(global_csv, per_corr_header, [["global"] + global_means])
 

@@ -8,6 +8,7 @@ from PIL import Image  # using pillow-simd for increased speed
 from PIL import ImageFile
 
 import torch
+import torch.nn.functional as F
 import torch.utils.data as data
 from torchvision import transforms
 
@@ -184,6 +185,21 @@ class MonoDataset(data.Dataset):
                 frame_index = int(line[1])
             side = line[2] if len(line) >= 3 else None
 
+        # Optional per-sample intrinsics hook (used by C3VD).
+        sample_K = self.K
+        intrinsics_from_file = None
+        if hasattr(self, "get_intrinsics_for_sample"):
+            try:
+                intr_ret = self.get_intrinsics_for_sample(folder, frame_index, side, do_flip)
+                if isinstance(intr_ret, tuple):
+                    sample_K = intr_ret[0]
+                    if len(intr_ret) > 1:
+                        intrinsics_from_file = intr_ret[1]
+                elif intr_ret is not None:
+                    sample_K = intr_ret
+            except Exception:
+                sample_K = self.K
+
         # frame_id = "{:06d}".format(int(frame_index))
         inputs["frame_id"] = torch.from_numpy(np.array(frame_index))
         
@@ -200,7 +216,7 @@ class MonoDataset(data.Dataset):
 
         # adjusting intrinsics to match each scale in the pyramid
         for scale in range(self.num_scales):
-            K = self.K.copy()
+            K = sample_K.copy()
             K[0, :] *= self.width // (2 ** scale)
             K[1, :] *= self.height // (2 ** scale)
 
@@ -209,6 +225,11 @@ class MonoDataset(data.Dataset):
 
             inputs[("K", scale)] = torch.from_numpy(K)
             inputs[("inv_K", scale)] = torch.from_numpy(inv_K)
+
+        if intrinsics_from_file is not None:
+            inputs["intrinsics_from_file"] = torch.tensor(
+                int(bool(intrinsics_from_file)), dtype=torch.int64
+            )
 
         if do_color_aug:
             color_aug = transforms.ColorJitter(self.brightness,self.contrast,self.saturation,self.hue)
@@ -219,6 +240,45 @@ class MonoDataset(data.Dataset):
         for i in self.frame_idxs:
             del inputs[("color", i, -1)]
             del inputs[("color_aug", i, -1)]
+
+        # Optional per-sample valid-region loss mask hook.
+        if hasattr(self, "get_loss_mask"):
+            try:
+                mask = self.get_loss_mask(folder, frame_index, side, do_flip)
+            except Exception:
+                mask = None
+
+            if mask is not None:
+                if isinstance(mask, np.ndarray):
+                    mask_t = torch.from_numpy(mask.astype(np.float32))
+                elif torch.is_tensor(mask):
+                    mask_t = mask.detach().float()
+                else:
+                    mask_t = torch.tensor(mask, dtype=torch.float32)
+
+                if mask_t.ndim == 2:
+                    mask_t = mask_t.unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
+                elif mask_t.ndim == 3:
+                    if mask_t.shape[0] == 1:
+                        mask_t = mask_t.unsqueeze(0)  # [1,1,H,W]
+                    elif mask_t.shape[-1] == 1:
+                        mask_t = mask_t.permute(2, 0, 1).unsqueeze(0)
+                    else:
+                        mask_t = mask_t[:1].unsqueeze(0)
+                elif mask_t.ndim == 4:
+                    mask_t = mask_t[:1, :1]
+                else:
+                    mask_t = mask_t.reshape(1, 1, self.height, self.width)
+
+                mask_t = (mask_t > 0.5).float()
+
+                for scale in range(self.num_scales):
+                    h_s = self.height // (2 ** scale)
+                    w_s = self.width // (2 ** scale)
+                    m_s = F.interpolate(mask_t, size=(h_s, w_s), mode="nearest")
+                    inputs[("loss_mask", scale)] = m_s.squeeze(0)
+
+                inputs["loss_mask"] = inputs[("loss_mask", 0)]
 
         if self.load_depth:
             depth_gt = self.get_depth(folder, frame_index, side, do_flip)

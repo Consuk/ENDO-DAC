@@ -100,6 +100,24 @@ class MonodepthOptions:
             help="(C3VD) Depth scale to decode *_depth.tiff (default is 100/65535 mm per level).",
             default=100.0 / 65535.0,
         )
+        self.parser.add_argument(
+            "--c3vd_use_loss_mask",
+            type=str2bool,
+            help="(C3VD) Apply per-sequence binary mask in photometric/reprojection losses.",
+            default=False,
+        )
+        self.parser.add_argument(
+            "--c3vd_mask_filename",
+            type=str,
+            help="(C3VD) Per-sequence mask filename (looked up inside each sequence folder).",
+            default="mask.png",
+        )
+        self.parser.add_argument(
+            "--c3vd_mask_erosion",
+            type=int,
+            help="(C3VD) Optional mask erosion radius in pixels (0 disables erosion).",
+            default=0,
+        )
 
 
         # Hamlyn intrinsics (used when --dataset hamlyn and --learn_intrinsics is False)
@@ -129,6 +147,12 @@ class MonodepthOptions:
             help="which training split to use",
             choices=["endovis", "hamlyn", "c3vd"],
             default="endovis",
+        )
+        self.parser.add_argument(
+            "--split_root",
+            type=str,
+            help="Optional root directory containing split folders (defaults to <repo>/splits).",
+            default=None,
         )
         self.parser.add_argument(
             "--num_layers",
